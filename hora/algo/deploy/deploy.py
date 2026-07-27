@@ -143,7 +143,10 @@ class HardwarePlayer(object):
             proprio_hist_buf[:] = torch.cat([priv_proprio_buf, cur_proprio_buf], dim=1)
 
     def restore(self, fn):
-        checkpoint = torch.load(fn)
+        # Explicit because checkpoints cross environments: they are written by training
+        # on the host (torch 2.7, where weights_only defaults to True since 2.6) and read
+        # here inside the devcontainer (torch 2.1.2).
+        checkpoint = torch.load(fn, weights_only=False)
         self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
         self.model.load_state_dict(checkpoint['model'])
         self.sa_mean_std.load_state_dict(checkpoint['sa_mean_std'])

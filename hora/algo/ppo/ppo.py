@@ -20,7 +20,7 @@ from hora.algo.models.running_mean_std import RunningMeanStd
 
 from hora.utils.misc import AverageScalarMeter
 
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 
 class PPO(object):
@@ -162,7 +162,7 @@ class PPO(object):
     def train(self):
         _t = time.time()
         _last_t = time.time()
-        self.obs = self.env.reset()
+        self.obs, _ = self.env.reset()
         self.agent_steps = self.batch_size
 
         while self.agent_steps < self.max_agent_steps:
@@ -199,6 +199,7 @@ class PPO(object):
                 self.save(os.path.join(self.nn_dir, 'best'))
 
         print('max steps achieved')
+        self.writer.flush()
 
     def save(self, name):
         weights = {
@@ -213,19 +214,19 @@ class PPO(object):
     def restore_train(self, fn):
         if not fn:
             return
-        checkpoint = torch.load(fn)
+        checkpoint = torch.load(fn, weights_only=False)
         self.model.load_state_dict(checkpoint['model'])
         self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
     def restore_test(self, fn):
-        checkpoint = torch.load(fn)
+        checkpoint = torch.load(fn, weights_only=False)
         self.model.load_state_dict(checkpoint['model'])
         if self.normalize_input:
             self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
     def test(self):
         self.set_eval()
-        obs_dict = self.env.reset()
+        obs_dict, _ = self.env.reset()
         while True:
             input_dict = {
                 'obs': self.running_mean_std(obs_dict['obs']),
@@ -233,7 +234,8 @@ class PPO(object):
             }
             mu = self.model.act_inference(input_dict)
             mu = torch.clamp(mu, -1.0, 1.0)
-            obs_dict, r, done, info = self.env.step(mu)
+            obs_dict, r, terminated, truncated, info = self.env.step(mu)
+            done = terminated | truncated
 
     def train_epoch(self):
         # collect minibatch data
@@ -325,7 +327,9 @@ class PPO(object):
                 self.storage.update_data(k, n, res_dict[k])
             # do env step
             actions = torch.clamp(res_dict['actions'], -1.0, 1.0)
-            self.obs, rewards, self.dones, infos = self.env.step(actions)
+            self.obs, rewards, terminated, truncated, infos = self.env.step(actions)
+            self.dones = terminated | truncated
+            infos['time_outs'] = truncated
             rewards = rewards.unsqueeze(1)
             # update dones and rewards after env step
             self.storage.update_data('dones', n, self.dones)

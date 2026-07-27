@@ -14,7 +14,7 @@ from termcolor import cprint
 from hora.utils.misc import AverageScalarMeter, tprint
 from hora.algo.models.models import ActorCritic
 from hora.algo.models.running_mean_std import RunningMeanStd
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 
 class ProprioAdapt(object):
@@ -89,7 +89,7 @@ class ProprioAdapt(object):
 
     def test(self):
         self.set_eval()
-        obs_dict = self.env.reset()
+        obs_dict, _ = self.env.reset()
         while True:
             input_dict = {
                 'obs': self.running_mean_std(obs_dict['obs']),
@@ -97,13 +97,14 @@ class ProprioAdapt(object):
             }
             mu = self.model.act_inference(input_dict)
             mu = torch.clamp(mu, -1.0, 1.0)
-            obs_dict, r, done, info = self.env.step(mu)
+            obs_dict, r, terminated, truncated, info = self.env.step(mu)
+            done = terminated | truncated
 
     def train(self):
         _t = time.time()
         _last_t = time.time()
 
-        obs_dict = self.env.reset()
+        obs_dict, _ = self.env.reset()
         self.agent_steps += self.batch_size
         while self.agent_steps <= 1e9:
             input_dict = {
@@ -119,7 +120,8 @@ class ProprioAdapt(object):
 
             mu = mu.detach()
             mu = torch.clamp(mu, -1.0, 1.0)
-            obs_dict, r, done, info = self.env.step(mu)
+            obs_dict, r, terminated, truncated, info = self.env.step(mu)
+            done = terminated | truncated
             self.agent_steps += self.batch_size
 
             # ---- statistics
@@ -159,7 +161,7 @@ class ProprioAdapt(object):
             self.writer.add_scalar(f'{k}/frame', v, self.agent_steps)
 
     def restore_train(self, fn):
-        checkpoint = torch.load(fn)
+        checkpoint = torch.load(fn, weights_only=False)
         cprint('careful, using non-strict matching', 'red', attrs=['bold'])
         self.model.load_state_dict(checkpoint['model'], strict=False)
         self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
@@ -167,7 +169,7 @@ class ProprioAdapt(object):
     def restore_test(self, fn):
         if not fn:
             return
-        checkpoint = torch.load(fn)
+        checkpoint = torch.load(fn, weights_only=False)
         self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
         self.model.load_state_dict(checkpoint['model'])
         self.sa_mean_std.load_state_dict(checkpoint['sa_mean_std'])

@@ -94,10 +94,6 @@ Isaaclab expects 3D models to be in .usd format. Previously, all assets where in
 This wraps IsaacLab's own `scripts/tools/convert_urdf.py`, which launches Isaac Sim once per asset — takes a while to complete. Output goes to `assets/usd/` (gitignored), and re-running skips what is already converted, so an interrupted run can just be restarted. Paths are derived from the script's own location, so it works from any working directory.
 Set `ISAACLAB=` if the IsaacLab repo is not at `~/code/IsaacLab`.
 
-Then check the hand asset:
-```bash
-python scripts/verify_hand_asset.py \
-    assets/usd/allegro/allegro_internal.usd assets/allegro/allegro_internal.urdf
-```
+## Train
 
-This must report that limits agree with `deploy.py`. It also prints the hora→PhysX joint index map that the env code depends on — PhysX orders DOFs breadth-first, so it is *not* the identity.
+

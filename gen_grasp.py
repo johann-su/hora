@@ -10,20 +10,20 @@
 # https://github.com/NVIDIA-Omniverse/IsaacGymEnvs/
 # --------------------------------------------------------
 
-import isaacgym
+# NOTE: this entry point is not yet ported -- grasp generation is M3 of the IsaacGym ->
+# IsaacLab migration (see docs/isaaclab_migration.md). It needs ContactSensor-based
+# fingertip/object contact detection to replace IsaacGym's CPU-only
+# get_env_rigid_contacts; see hora/tasks/allegro_hand_grasp.py.
+#
+# Use the published grasp caches (README.md) until then -- cache/*.npy covers every
+# scale in randomizeScaleList.
 
-import os
 import hydra
-import datetime
-from termcolor import cprint
 from omegaconf import DictConfig, OmegaConf
-from hydra.utils import to_absolute_path
 
-from hora.algo.ppo.ppo import PPO
-from hora.algo.padapt.padapt import ProprioAdapt
-from hora.tasks import isaacgym_task_map
-from hora.utils.reformat import omegaconf_to_dict, print_dict
-from hora.utils.misc import set_np_formatting, set_seed, git_hash, git_diff_config
+from hora.tasks import make_task  # noqa: F401  (M3 will build the grasp task through this)
+from hora.utils.misc import set_np_formatting, set_seed
+from hora.utils.reformat import omegaconf_to_dict
 
 
 ## OmegaConf & Hydra Config
@@ -39,27 +39,15 @@ OmegaConf.register_new_resolver('resolve_default', lambda default, arg: default 
 
 @hydra.main(config_name='config', config_path='configs')
 def main(config: DictConfig):
-    if config.checkpoint:
-        config.checkpoint = to_absolute_path(config.checkpoint)
-
     # set numpy formatting for printing only
     set_np_formatting()
 
     # sets seed. if seed is -1 will pick a random one
     config.seed = set_seed(config.seed)
 
-    cprint('Start Building the Environment', 'green', attrs=['bold'])
-    env = isaacgym_task_map[config.task_name](
-        config=omegaconf_to_dict(config.task),
-        sim_device=config.sim_device,
-        graphics_device_id=config.graphics_device_id,
-        headless=config.headless,
-    )
-
-    env.reset()
-    while True:
-        actions = env.zero_actions()
-        _ = env.step(actions)
+    raise NotImplementedError(
+        'Grasp generation has not been ported to IsaacLab yet (M3 of '
+        'docs/isaaclab_migration.md). Use the published caches in cache/ for now.')
 
 
 if __name__ == '__main__':

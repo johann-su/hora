@@ -4,37 +4,62 @@
 # Copyright (c) 2022 Haozhi Qi
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+# Ported from IsaacGym to IsaacLab. See docs/isaaclab_migration.md.
+# --------------------------------------------------------
+
+from __future__ import annotations
 
 import os
-import torch
+
+import gymnasium as gym
 import numpy as np
-from isaacgym import gymtorch
-from isaacgym import gymapi
-from isaacgym.torch_utils import to_torch, unscale, quat_apply, tensor_clamp, torch_rand_float, quat_conjugate, quat_mul
-from glob import glob
+import torch
+from isaaclab.assets import Articulation, RigidObject
+from isaaclab.envs import DirectRLEnv
+from isaaclab.sim import SimulationCfg  # noqa: F401  (re-exported for cfg typing)
+from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul
+
+from hora.tasks.allegro_hand_hora_cfg import HORA_JOINT_ORDER, AllegroHandHoraEnvCfg
+from hora.utils.math_utils import quat_xyzw_to_wxyz, tensor_clamp, torch_rand_float, unscale
 from hora.utils.misc import tprint
-from .base.vec_task import VecTask
 
 
-class AllegroHandHora(VecTask):
-    def __init__(self, config, sim_device, graphics_device_id, headless):
-        self.config = config
-        # before calling init in VecTask, need to do
-        # 1. setup randomization
-        self._setup_domain_rand_config(config['env']['randomization'])
-        # 2. setup privileged information
-        self._setup_priv_option_config(config['env']['privInfo'])
-        # 3. setup object assets
-        self._setup_object_info(config['env']['object'])
-        # 4. setup reward
-        self._setup_reward_config(config['env']['reward'])
-        self.base_obj_scale = config['env']['baseObjScale']
-        self.save_init_pose = config['env']['genGrasps']
-        self.aggregate_mode = self.config['env']['aggregateMode']
-        self.up_axis = 'z'
-        self.reset_z_threshold = self.config['env']['reset_height_threshold']
-        self.grasp_cache_name = self.config['env']['grasp_cache_name']
-        self.evaluate = self.config['on_evaluation']
+class AllegroHandHora(DirectRLEnv):
+    """In-hand object rotation.
+
+    Ordering note, because it is the single easiest thing to get wrong here: everything
+    policy-facing (observations, actions, targets, joint limits, the grasp cache) is in
+    *hora order* -- index, thumb, middle, ring. PhysX reports joints breadth-first, in a
+    different order entirely. ``self._joint_idx`` maps hora order onto PhysX order and is
+    passed as ``joint_ids=`` on every read and write, so no other code in this file has
+    to think about it.
+    """
+
+    cfg: AllegroHandHoraEnvCfg
+
+    def __init__(self, cfg: AllegroHandHoraEnvCfg, task_cfg: dict,
+                 render_mode: str | None = None, **kwargs):
+        self.task_cfg = task_cfg
+        self._setup_domain_rand_config(task_cfg['env']['randomization'])
+        self._setup_priv_option_config(task_cfg['env']['privInfo'])
+        self._setup_reward_config(task_cfg['env']['reward'])
+
+        controller = task_cfg['env']['controller']
+        self.torque_control = controller['torque_control']
+        self.p_gain_val = controller['pgain']
+        self.d_gain_val = controller['dgain']
+        self.control_freq_inv = controller['controlFrequencyInv']
+
+        self.clip_obs = task_cfg['env'].get('clipObservations', np.inf)
+        self.clip_actions = task_cfg['env'].get('clipActions', np.inf)
+        self.reset_z_threshold = task_cfg['env']['reset_height_threshold']
+        self.grasp_cache_name = task_cfg['env']['grasp_cache_name']
+        self.base_obj_scale = task_cfg['env']['baseObjScale']
+        self.save_init_pose = task_cfg['env']['genGrasps']
+        self.evaluate = task_cfg['on_evaluation']
+
+        self.prop_hist_len = task_cfg['env']['hora']['propHistoryLen']
+        self.num_env_factors = task_cfg['env']['hora']['privInfoDim']
         self.priv_info_dict = {
             'obj_position': (0, 3),
             'obj_scale': (3, 4),
@@ -43,74 +68,86 @@ class AllegroHandHora(VecTask):
             'obj_com': (6, 9),
         }
 
-        super().__init__(config, sim_device, graphics_device_id, headless)
+        super().__init__(cfg, render_mode, **kwargs)
 
-        self.debug_viz = self.config['env']['enableDebugVis']
-        self.max_episode_length = self.config['env']['episodeLength']
-        self.dt = self.sim_params.dt
+        # hora's PPO/ProprioAdapt read `.shape`, `.low` and `.high` off these and expect
+        # the *single*-env spaces, not the batched ones DirectRLEnv installs.
+        self.observation_space = self.single_observation_space['policy']
+        self.action_space = self.single_action_space
 
-        if self.viewer:
-            cam_pos = gymapi.Vec3(0.0, 0.4, 1.5)
-            cam_target = gymapi.Vec3(0.0, 0.0, 0.5)
-            self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
+        self.num_actions = self.cfg.action_space
+        self.num_obs = self.cfg.observation_space
 
-        # get gym GPU state tensors
-        actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
-        dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
-        rigid_body_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
-        net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
+        self._resolve_joint_order()
+        self._allocate_buffers()
+        self._load_grasp_cache()
 
-        # create some wrapper tensors for different slices
-        self.allegro_hand_default_dof_pos = torch.zeros(self.num_allegro_hand_dofs, dtype=torch.float, device=self.device)
-        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
-        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)
-        self.allegro_hand_dof_state = self.dof_state.view(self.num_envs, -1, 2)[:, :self.num_allegro_hand_dofs]
-        self.allegro_hand_dof_pos = self.allegro_hand_dof_state[..., 0]
-        self.allegro_hand_dof_vel = self.allegro_hand_dof_state[..., 1]
+    # ------------------------------------------------------------------ setup
 
-        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_tensor).view(self.num_envs, -1, 13)
-        self.num_bodies = self.rigid_body_states.shape[1]
+    def _resolve_joint_order(self):
+        """Pin the hora <-> PhysX joint mapping, and fail loudly if the asset changed."""
+        idx, names = self.hand.find_joints(HORA_JOINT_ORDER, preserve_order=True)
+        if names != HORA_JOINT_ORDER:
+            raise RuntimeError(
+                f'hand asset joints do not match the expected set.\n'
+                f'  wanted: {HORA_JOINT_ORDER}\n  got:    {names}')
+        self._joint_idx = idx
 
-        self.root_state_tensor = gymtorch.wrap_tensor(actor_root_state_tensor).view(-1, 13)
+        limits = self.hand.data.joint_pos_limits[0, self._joint_idx]
+        self.hand_dof_lower = limits[:, 0].clone()
+        self.hand_dof_upper = limits[:, 1].clone()
+        self.num_hand_dofs = len(idx)
 
-        self._refresh_gym()
+    def _setup_scene(self):
+        self.hand = Articulation(self.cfg.robot_cfg)
+        self.object = RigidObject(self.cfg.object_cfg)
 
-        self.num_dofs = self.gym.get_sim_dof_count(self.sim) // self.num_envs
+        spawn_ground_plane(self)
 
-        self.prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
-        self.cur_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
-        # object apply random forces parameters
-        self.force_scale = self.config['env'].get('forceScale', 0.0)
-        self.random_force_prob_scalar = self.config['env'].get('randomForceProbScalar', 0.0)
-        self.force_decay = self.config['env'].get('forceDecay', 0.99)
-        self.force_decay_interval = self.config['env'].get('forceDecayInterval', 0.08)
-        self.force_decay = to_torch(self.force_decay, dtype=torch.float, device=self.device)
-        self.rb_forces = torch.zeros((self.num_envs, self.num_bodies, 3), dtype=torch.float, device=self.device)
+        # copy_from_source=False keeps the clones as USD references into one source prim,
+        # which is what makes replicate_physics viable at this env count.
+        self.scene.clone_environments(copy_from_source=False)
+        self.scene.articulations['hand'] = self.hand
+        self.scene.rigid_objects['object'] = self.object
 
-        if self.randomize_scale and self.scale_list_init:
-            self.saved_grasping_states = {}
-            for s in self.randomize_scale_list:
-                self.saved_grasping_states[str(s)] = torch.from_numpy(np.load(
-                    f'cache/{self.grasp_cache_name}_grasp_50k_s{str(s).replace(".", "")}.npy'
-                )).float().to(self.device)
-        else:
-            assert self.save_init_pose
+        light_cfg = _dome_light_cfg()
+        light_cfg.func('/World/Light', light_cfg)
 
-        self.rot_axis_buf = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
+    def _allocate_buffers(self):
+        n, device = self.num_envs, self.device
 
-        # useful buffers
-        self.object_rot_prev = self.object_rot.clone()
+        # NOT `obs_buf`: DirectRLEnv owns that attribute and stores the observation
+        # dict in it on every step, which would silently clobber this tensor.
+        self._obs = torch.zeros((n, self.num_obs), device=device)
+        # 80 frames of (16 joint pos + 16 targets); observations read the last 3 and the
+        # proprioceptive history reads the last `prop_hist_len`.
+        self.obs_buf_lag_history = torch.zeros((n, 80, self.num_obs // 3), device=device)
+        self.priv_info_buf = torch.zeros((n, self.num_env_factors), device=device)
+        self.proprio_hist_buf = torch.zeros((n, self.prop_hist_len, 32), device=device)
+
+        self.at_reset_buf = torch.ones(n, device=device, dtype=torch.long)
+        self.prev_targets = torch.zeros((n, self.num_hand_dofs), device=device)
+        self.cur_targets = torch.zeros((n, self.num_hand_dofs), device=device)
+        self.init_pose_buf = torch.zeros((n, self.num_hand_dofs), device=device)
+        self.actions = torch.zeros((n, self.num_actions), device=device)
+        self.torques = torch.zeros((n, self.num_actions), device=device)
+        self.dof_vel_finite_diff = torch.zeros((n, self.num_hand_dofs), device=device)
+        self.rot_axis_buf = torch.zeros((n, 3), device=device)
+
+        self.p_gain = torch.ones((n, self.num_actions), device=device) * self.p_gain_val
+        self.d_gain = torch.ones((n, self.num_actions), device=device) * self.d_gain_val
+
         self.object_pos_prev = self.object_pos.clone()
-        self.init_pose_buf = torch.zeros((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float)
-        self.actions = torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=torch.float)
-        self.torques = torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=torch.float)
-        self.dof_vel_finite_diff = torch.zeros((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float)
-        assert type(self.p_gain) in [int, float] and type(self.d_gain) in [int, float], 'assume p_gain and d_gain are only scalars'
-        self.p_gain = torch.ones((self.num_envs, self.num_actions), device=self.device, dtype=torch.float) * self.p_gain
-        self.d_gain = torch.ones((self.num_envs, self.num_actions), device=self.device, dtype=torch.float) * self.d_gain
+        self.object_rot_prev = self.object_rot.clone()
 
-        # debug and understanding statistics
-        self.env_timeout_counter = to_torch(np.zeros((len(self.envs)))).long().to(self.device)  # max 10 (10000 envs)
+        # random-force perturbation
+        self.force_scale = self.task_cfg['env'].get('forceScale', 0.0)
+        self.random_force_prob_scalar = self.task_cfg['env'].get('randomForceProbScalar', 0.0)
+        self.force_decay = self.task_cfg['env'].get('forceDecay', 0.99)
+        self.force_decay_interval = self.task_cfg['env'].get('forceDecayInterval', 0.08)
+        self.rb_forces = torch.zeros((n, 1, 3), device=device)
+
+        # evaluation statistics
         self.stat_sum_rewards = 0
         self.stat_sum_rotate_rewards = 0
         self.stat_sum_episode_length = 0
@@ -119,229 +156,171 @@ class AllegroHandHora(VecTask):
         self.env_evaluated = 0
         self.max_evaluate_envs = 500000
 
-    def _create_envs(self, num_envs, spacing, num_per_row):
-        self._create_ground_plane()
-        lower = gymapi.Vec3(-spacing, -spacing, 0.0)
-        upper = gymapi.Vec3(spacing, spacing, spacing)
+    def _load_grasp_cache(self):
+        """Load the per-scale grasp caches, converting them out of IsaacGym conventions.
 
-        self._create_object_asset()
+        Layout is [16 joint pos (hora order), 3 object xyz, 4 object quat]. The quat is
+        **xyzw** because the caches were generated by the old IsaacGym code; the joint
+        columns are already in hora order (verified against the thumb's strictly-positive
+        joint_12_0 range).
+        """
+        scales = self.randomize_scale_list if self.randomize_scale else [self.base_obj_scale]
+        self.saved_grasping_states = {}
+        for s in scales:
+            name = f'cache/{self.grasp_cache_name}_grasp_50k_s{str(s).replace(".", "")}.npy'
+            if not os.path.isfile(name):
+                raise FileNotFoundError(
+                    f'grasp cache not found: {name}\n'
+                    'Download the published caches (see README.md) or generate them with '
+                    'gen_grasp.py (M3 of docs/isaaclab_migration.md).')
+            data = torch.from_numpy(np.load(name)).float().to(self.device)
+            data[:, 19:23] = quat_xyzw_to_wxyz(data[:, 19:23])
+            self.saved_grasping_states[str(s)] = data
 
-        # set allegro_hand dof properties
-        self.num_allegro_hand_dofs = self.gym.get_asset_dof_count(self.hand_asset)
-        allegro_hand_dof_props = self.gym.get_asset_dof_properties(self.hand_asset)
+    # ------------------------------------------------------------------ properties
 
-        self.allegro_hand_dof_lower_limits = []
-        self.allegro_hand_dof_upper_limits = []
+    @property
+    def object_pos(self) -> torch.Tensor:
+        """Object position in *env-local* frame.
 
-        for i in range(self.num_allegro_hand_dofs):
-            self.allegro_hand_dof_lower_limits.append(allegro_hand_dof_props['lower'][i])
-            self.allegro_hand_dof_upper_limits.append(allegro_hand_dof_props['upper'][i])
-            allegro_hand_dof_props['effort'][i] = 0.5
-            if self.torque_control:
-                allegro_hand_dof_props['stiffness'][i] = 0.
-                allegro_hand_dof_props['damping'][i] = 0.
-                allegro_hand_dof_props['driveMode'][i] = gymapi.DOF_MODE_EFFORT
-            else:
-                allegro_hand_dof_props['stiffness'][i] = self.config['env']['controller']['pgain']
-                allegro_hand_dof_props['damping'][i] = self.config['env']['controller']['dgain']
-            allegro_hand_dof_props['friction'][i] = 0.01
-            allegro_hand_dof_props['armature'][i] = 0.001
+        ``root_pos_w`` includes the env origin; every threshold and offset in this task
+        is expressed relative to the hand, so the origin has to come back out.
+        """
+        return self.object.data.root_pos_w - self.scene.env_origins
 
-        self.allegro_hand_dof_lower_limits = to_torch(self.allegro_hand_dof_lower_limits, device=self.device)
-        self.allegro_hand_dof_upper_limits = to_torch(self.allegro_hand_dof_upper_limits, device=self.device)
+    @property
+    def object_rot(self) -> torch.Tensor:
+        return self.object.data.root_quat_w
 
-        hand_pose, obj_pose = self._init_object_pose()
+    @property
+    def hand_dof_pos(self) -> torch.Tensor:
+        return self.hand.data.joint_pos[:, self._joint_idx]
 
-        # compute aggregate size
-        self.num_allegro_hand_bodies = self.gym.get_asset_rigid_body_count(self.hand_asset)
-        self.num_allegro_hand_shapes = self.gym.get_asset_rigid_shape_count(self.hand_asset)
-        max_agg_bodies = self.num_allegro_hand_bodies + 2
-        max_agg_shapes = self.num_allegro_hand_shapes + 2
+    @property
+    def hand_dof_vel(self) -> torch.Tensor:
+        return self.hand.data.joint_vel[:, self._joint_idx]
 
-        self.envs = []
+    # ------------------------------------------------------------------ stepping
 
-        self.object_init_state = []
+    def _pre_physics_step(self, actions: torch.Tensor):
+        self.actions = torch.clamp(actions.clone(), -self.clip_actions, self.clip_actions)
+        targets = self.prev_targets + 1 / 24 * self.actions
+        self.cur_targets[:] = tensor_clamp(targets, self.hand_dof_lower, self.hand_dof_upper)
+        self.prev_targets[:] = self.cur_targets.clone()
 
-        self.hand_indices = []
-        self.object_indices = []
+        self.object_rot_prev[:] = self.object_rot
+        self.object_pos_prev[:] = self.object_pos
 
-        allegro_hand_rb_count = self.gym.get_asset_rigid_body_count(self.hand_asset)
-        object_rb_count = 1
-        self.object_rb_handles = list(range(allegro_hand_rb_count, allegro_hand_rb_count + object_rb_count))
+        if self.force_scale > 0.0:
+            self._apply_random_forces()
 
-        for i in range(num_envs):
-            # create env instance
-            env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
-            if self.aggregate_mode >= 1:
-                self.gym.begin_aggregate(env_ptr, max_agg_bodies * 20, max_agg_shapes * 20, True)
+    def _apply_random_forces(self):
+        self.rb_forces *= torch.pow(
+            torch.tensor(self.force_decay, device=self.device),
+            self.cfg.sim.dt / self.force_decay_interval)
+        obj_mass = self.object.data.default_mass.to(self.device).sum(-1)
+        force_indices = torch.less(
+            torch.rand(self.num_envs, device=self.device), self.random_force_prob_scalar)
+        rand = torch.randn((self.num_envs, 1, 3), device=self.device)
+        self.rb_forces[force_indices] = (
+            rand[force_indices] * obj_mass[force_indices, None, None] * self.force_scale)
+        self.object.set_external_force_and_torque(
+            self.rb_forces, torch.zeros_like(self.rb_forces))
 
-            # add hand - collision filter = -1 to use asset collision filters set in mjcf loader
-            hand_actor = self.gym.create_actor(env_ptr, self.hand_asset, hand_pose, 'hand', i, -1, 0)
-            self.gym.set_actor_dof_properties(env_ptr, hand_actor, allegro_hand_dof_props)
-            hand_idx = self.gym.get_actor_index(env_ptr, hand_actor, gymapi.DOMAIN_SIM)
-            self.hand_indices.append(hand_idx)
+    def _apply_action(self):
+        """Called once per physics step inside the decimation loop -- hora's 120 Hz PD."""
+        previous_dof_pos = self.hand_dof_pos.clone()
+        self.hand.update(self.cfg.sim.dt)
 
-            # add object
-            object_type_id = np.random.choice(len(self.object_type_list), p=self.object_type_prob)
-            object_asset = self.object_asset_list[object_type_id]
+        if self.torque_control:
+            dof_pos = self.hand_dof_pos
+            dof_vel = (dof_pos - previous_dof_pos) / self.cfg.sim.dt
+            self.dof_vel_finite_diff = dof_vel.clone()
+            torques = self.p_gain * (self.cur_targets - dof_pos) - self.d_gain * dof_vel
+            self.torques = torch.clip(torques, -0.5, 0.5).clone()
+            self.hand.set_joint_effort_target(self.torques, joint_ids=self._joint_idx)
+        else:
+            self.hand.set_joint_position_target(self.cur_targets, joint_ids=self._joint_idx)
 
-            object_handle = self.gym.create_actor(env_ptr, object_asset, obj_pose, 'object', i, 0, 0)
-            self.object_init_state.append([
-                obj_pose.p.x, obj_pose.p.y, obj_pose.p.z,
-                obj_pose.r.x, obj_pose.r.y, obj_pose.r.z, obj_pose.r.w,
-                0, 0, 0, 0, 0, 0
-            ])
-            object_idx = self.gym.get_actor_index(env_ptr, object_handle, gymapi.DOMAIN_SIM)
-            self.object_indices.append(object_idx)
+    # ------------------------------------------------------------------ observations
 
-            obj_scale = self.base_obj_scale
-            if self.randomize_scale:
-                num_scales = len(self.randomize_scale_list)
-                obj_scale = np.random.uniform(self.randomize_scale_list[i % num_scales] - 0.025, self.randomize_scale_list[i % num_scales] + 0.025)
-            self.gym.set_actor_scale(env_ptr, object_handle, obj_scale)
-            self._update_priv_buf(env_id=i, name='obj_scale', value=obj_scale)
-
-            obj_com = [0, 0, 0]
-            if self.randomize_com:
-                prop = self.gym.get_actor_rigid_body_properties(env_ptr, object_handle)
-                assert len(prop) == 1
-                obj_com = [np.random.uniform(self.randomize_com_lower, self.randomize_com_upper),
-                           np.random.uniform(self.randomize_com_lower, self.randomize_com_upper),
-                           np.random.uniform(self.randomize_com_lower, self.randomize_com_upper)]
-                prop[0].com.x, prop[0].com.y, prop[0].com.z = obj_com
-                self.gym.set_actor_rigid_body_properties(env_ptr, object_handle, prop)
-            self._update_priv_buf(env_id=i, name='obj_com', value=obj_com)
-
-            obj_friction = 1.0
-            if self.randomize_friction:
-                rand_friction = np.random.uniform(self.randomize_friction_lower, self.randomize_friction_upper)
-                hand_props = self.gym.get_actor_rigid_shape_properties(env_ptr, hand_actor)
-                for p in hand_props:
-                    p.friction = rand_friction
-                self.gym.set_actor_rigid_shape_properties(env_ptr, hand_actor, hand_props)
-
-                object_props = self.gym.get_actor_rigid_shape_properties(env_ptr, object_handle)
-                for p in object_props:
-                    p.friction = rand_friction
-                self.gym.set_actor_rigid_shape_properties(env_ptr, object_handle, object_props)
-                obj_friction = rand_friction
-            self._update_priv_buf(env_id=i, name='obj_friction', value=obj_friction)
-
-            if self.randomize_mass:
-                prop = self.gym.get_actor_rigid_body_properties(env_ptr, object_handle)
-                for p in prop:
-                    p.mass = np.random.uniform(self.randomize_mass_lower, self.randomize_mass_upper)
-                self.gym.set_actor_rigid_body_properties(env_ptr, object_handle, prop)
-                self._update_priv_buf(env_id=i, name='obj_mass', value=prop[0].mass)
-            else:
-                prop = self.gym.get_actor_rigid_body_properties(env_ptr, object_handle)
-                self._update_priv_buf(env_id=i, name='obj_mass', value=prop[0].mass)
-
-            if self.aggregate_mode > 0:
-                self.gym.end_aggregate(env_ptr)
-
-            self.envs.append(env_ptr)
-
-        self.object_init_state = to_torch(self.object_init_state, device=self.device, dtype=torch.float).view(self.num_envs, 13)
-        self.object_rb_handles = to_torch(self.object_rb_handles, dtype=torch.long, device=self.device)
-        self.hand_indices = to_torch(self.hand_indices, dtype=torch.long, device=self.device)
-        self.object_indices = to_torch(self.object_indices, dtype=torch.long, device=self.device)
-
-    def reset_idx(self, env_ids):
-        if self.randomize_pd_gains:
-            self.p_gain[env_ids] = torch_rand_float(
-                self.randomize_p_gain_lower, self.randomize_p_gain_upper, (len(env_ids), self.num_actions),
-                device=self.device).squeeze(1)
-            self.d_gain[env_ids] = torch_rand_float(
-                self.randomize_d_gain_lower, self.randomize_d_gain_upper, (len(env_ids), self.num_actions),
-                device=self.device).squeeze(1)
-
-        # reset rigid body forces
-        self.rb_forces[env_ids, :, :] = 0.0
-
-        num_scales = len(self.randomize_scale_list)
-        for n_s in range(num_scales):
-            s_ids = env_ids[(env_ids % num_scales == n_s).nonzero(as_tuple=False).squeeze(-1)]
-            if len(s_ids) == 0:
-                continue
-            obj_scale = self.randomize_scale_list[n_s]
-            scale_key = str(obj_scale)
-            sampled_pose_idx = np.random.randint(self.saved_grasping_states[scale_key].shape[0], size=len(s_ids))
-            sampled_pose = self.saved_grasping_states[scale_key][sampled_pose_idx].clone()
-            self.root_state_tensor[self.object_indices[s_ids], :7] = sampled_pose[:, 16:]
-            self.root_state_tensor[self.object_indices[s_ids], 7:13] = 0
-            pos = sampled_pose[:, :16]
-            self.allegro_hand_dof_pos[s_ids, :] = pos
-            self.allegro_hand_dof_vel[s_ids, :] = 0
-            self.prev_targets[s_ids, :self.num_allegro_hand_dofs] = pos
-            self.cur_targets[s_ids, :self.num_allegro_hand_dofs] = pos
-            self.init_pose_buf[s_ids, :] = pos.clone()
-
-        object_indices = torch.unique(self.object_indices[env_ids]).to(torch.int32)
-        self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.root_state_tensor), gymtorch.unwrap_tensor(object_indices), len(object_indices))
-        hand_indices = self.hand_indices[env_ids].to(torch.int32)
-        if not self.torque_control:
-            self.gym.set_dof_position_target_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.prev_targets), gymtorch.unwrap_tensor(hand_indices), len(env_ids))
-        self.gym.set_dof_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.dof_state), gymtorch.unwrap_tensor(hand_indices), len(env_ids))
-
-        self.progress_buf[env_ids] = 0
-        self.obs_buf[env_ids] = 0
-        self.rb_forces[env_ids] = 0
-        self.priv_info_buf[env_ids, 0:3] = 0
-        self.proprio_hist_buf[env_ids] = 0
-        self.at_reset_buf[env_ids] = 1
-
-    def compute_observations(self):
-        self._refresh_gym()
-        # deal with normal observation, do sliding window
+    def _get_observations(self) -> dict:
         prev_obs_buf = self.obs_buf_lag_history[:, 1:].clone()
-        joint_noise_matrix = (torch.rand(self.allegro_hand_dof_pos.shape) * 2.0 - 1.0) * self.joint_noise_scale
+
+        joint_noise = (torch.rand_like(self.hand_dof_pos) * 2.0 - 1.0) * self.joint_noise_scale
         cur_obs_buf = unscale(
-            joint_noise_matrix.to(self.device) + self.allegro_hand_dof_pos, self.allegro_hand_dof_lower_limits, self.allegro_hand_dof_upper_limits
+            joint_noise + self.hand_dof_pos, self.hand_dof_lower, self.hand_dof_upper
         ).clone().unsqueeze(1)
         cur_tar_buf = self.cur_targets[:, None]
         cur_obs_buf = torch.cat([cur_obs_buf, cur_tar_buf], dim=-1)
         self.obs_buf_lag_history[:] = torch.cat([prev_obs_buf, cur_obs_buf], dim=1)
 
-        # refill the initialized buffers
-        at_reset_env_ids = self.at_reset_buf.nonzero(as_tuple=False).squeeze(-1)
-        self.obs_buf_lag_history[at_reset_env_ids, :, 0:16] = unscale(
-            self.allegro_hand_dof_pos[at_reset_env_ids], self.allegro_hand_dof_lower_limits,
-            self.allegro_hand_dof_upper_limits
-        ).clone().unsqueeze(1)
-        self.obs_buf_lag_history[at_reset_env_ids, :, 16:32] = self.allegro_hand_dof_pos[at_reset_env_ids].unsqueeze(1)
-        t_buf = (self.obs_buf_lag_history[:, -3:].reshape(self.num_envs, -1)).clone()
+        # Freshly reset envs have no history, so backfill every frame with the current
+        # pose rather than letting zeros leak into the observation.
+        at_reset = self.at_reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(at_reset) > 0:
+            self.obs_buf_lag_history[at_reset, :, 0:16] = unscale(
+                self.hand_dof_pos[at_reset], self.hand_dof_lower, self.hand_dof_upper
+            ).clone().unsqueeze(1)
+            self.obs_buf_lag_history[at_reset, :, 16:32] = \
+                self.hand_dof_pos[at_reset].unsqueeze(1)
+            self.at_reset_buf[at_reset] = 0
 
-        self.obs_buf[:, :t_buf.shape[1]] = t_buf
-        self.at_reset_buf[at_reset_env_ids] = 0
-
+        t_buf = self.obs_buf_lag_history[:, -3:].reshape(self.num_envs, -1).clone()
+        self._obs[:, :t_buf.shape[1]] = t_buf
         self.proprio_hist_buf[:] = self.obs_buf_lag_history[:, -self.prop_hist_len:].clone()
-        self._update_priv_buf(env_id=range(self.num_envs), name='obj_position', value=self.object_pos.clone())
+        self._update_priv_buf(slice(None), 'obj_position', self.object_pos.clone())
 
-    def compute_reward(self, actions):
+        obs = torch.clamp(self._obs, -self.clip_obs, self.clip_obs)
+        # 'policy' is the key IsaacLab/gymnasium expect; 'obs' is the alias hora's
+        # trainers use. Same tensor, so the duplication costs nothing.
+        return {
+            'policy': obs,
+            'obs': obs,
+            'priv_info': self.priv_info_buf,
+            'proprio_hist': self.proprio_hist_buf,
+        }
+
+    def _update_priv_buf(self, env_id, name, value, lower=None, upper=None):
+        s, e = self.priv_info_dict[name]
+        if getattr(self, f'enable_priv_{name}'):
+            if isinstance(value, list):
+                value = torch.tensor(value, dtype=torch.float, device=self.device)
+            if lower is not None and upper is not None:
+                value = (2.0 * value - upper - lower) / (upper - lower)
+            self.priv_info_buf[env_id, s:e] = value
+        else:
+            self.priv_info_buf[env_id, s:e] = 0
+
+    # ------------------------------------------------------------------ reward / done
+
+    def _get_rewards(self) -> torch.Tensor:
         self.rot_axis_buf[:, -1] = -1
-        # pose diff penalty
-        pose_diff_penalty = ((self.allegro_hand_dof_pos - self.init_pose_buf) ** 2).sum(-1)
-        # work and torque penalty
+
+        pose_diff_penalty = ((self.hand_dof_pos - self.init_pose_buf) ** 2).sum(-1)
         torque_penalty = (self.torques ** 2).sum(-1)
         work_penalty = ((self.torques * self.dof_vel_finite_diff).sum(-1)) ** 2
-        # Compute offset in radians. Radians -> radians / sec
-        angdiff = quat_to_axis_angle(quat_mul(self.object_rot, quat_conjugate(self.object_rot_prev)))
-        object_angvel = angdiff / (self.control_freq_inv * self.dt)
+
+        # Angular velocity from the frame-to-frame quaternion delta. axis_angle_from_quat
+        # is IsaacLab's wxyz-native replacement for hora's hand-rolled xyzw helper.
+        angdiff = axis_angle_from_quat(
+            quat_mul(self.object_rot, quat_conjugate(self.object_rot_prev)))
+        object_angvel = angdiff / (self.control_freq_inv * self.cfg.sim.dt)
         vec_dot = (object_angvel * self.rot_axis_buf).sum(-1)
         rotate_reward = torch.clip(vec_dot, max=self.angvel_clip_max, min=self.angvel_clip_min)
-        # linear velocity: use position difference instead of self.object_linvel
-        object_linvel = ((self.object_pos - self.object_pos_prev) / (self.control_freq_inv * self.dt)).clone()
+
+        object_linvel = (self.object_pos - self.object_pos_prev) / \
+            (self.control_freq_inv * self.cfg.sim.dt)
         object_linvel_penalty = torch.norm(object_linvel, p=1, dim=-1)
 
-        self.rew_buf[:] = compute_hand_reward(
-            object_linvel_penalty, self.object_linvel_penalty_scale,
-            rotate_reward, self.rotate_reward_scale,
-            pose_diff_penalty, self.pose_diff_penalty_scale,
-            torque_penalty, self.torque_penalty_scale,
-            work_penalty, self.work_penalty_scale,
+        reward = (
+            self.rotate_reward_scale * rotate_reward
+            + object_linvel_penalty * self.object_linvel_penalty_scale
+            + pose_diff_penalty * self.pose_diff_penalty_scale
+            + torque_penalty * self.torque_penalty_scale
+            + work_penalty * self.work_penalty_scale
         )
-        self.reset_buf[:] = self.check_termination(self.object_pos)
+
         self.extras['rotation_reward'] = rotate_reward.mean()
         self.extras['object_linvel_penalty'] = object_linvel_penalty.mean()
         self.extras['pose_diff_penalty'] = pose_diff_penalty.mean()
@@ -352,117 +331,87 @@ class AllegroHandHora(VecTask):
         self.extras['yaw'] = object_angvel[:, 2].mean()
 
         if self.evaluate:
-            finished_episode_mask = self.reset_buf == 1
-            self.stat_sum_rewards += self.rew_buf.sum()
-            self.stat_sum_rotate_rewards += rotate_reward.sum()
-            self.stat_sum_torques += self.torques.abs().sum()
-            self.stat_sum_obj_linvel += (self.object_linvel ** 2).sum(-1).sum()
-            self.stat_sum_episode_length += (self.reset_buf == 0).sum()
-            self.env_evaluated += (self.reset_buf == 1).sum()
-            self.env_timeout_counter[finished_episode_mask] += 1
-            info = f'progress {self.env_evaluated} / {self.max_evaluate_envs} | ' \
-                   f'reward: {self.stat_sum_rewards / self.env_evaluated:.2f} | ' \
-                   f'eps length: {self.stat_sum_episode_length / self.env_evaluated:.2f} | ' \
-                   f'rotate reward: {self.stat_sum_rotate_rewards / self.env_evaluated:.2f} | ' \
-                   f'lin vel (x100): {self.stat_sum_obj_linvel * 100 / self.stat_sum_episode_length:.4f} | ' \
-                   f'command torque: {self.stat_sum_torques / self.stat_sum_episode_length:.2f}'
-            tprint(info)
-            if self.env_evaluated >= self.max_evaluate_envs:
-                exit()
+            self._update_eval_stats(reward, rotate_reward)
+        return reward
 
-    def post_physics_step(self):
-        self.progress_buf += 1
-        self.reset_buf[:] = 0
-        self._refresh_gym()
-        self.compute_reward(self.actions)
-        env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-        if len(env_ids) > 0:
-            self.reset_idx(env_ids)
-        self.compute_observations()
+    def _update_eval_stats(self, reward, rotate_reward):
+        dropped = torch.less(self.object_pos[:, -1], self.reset_z_threshold)
+        self.stat_sum_rewards += reward.sum()
+        self.stat_sum_rotate_rewards += rotate_reward.sum()
+        self.stat_sum_torques += self.torques.abs().sum()
+        self.stat_sum_obj_linvel += (self.object.data.root_lin_vel_w ** 2).sum(-1).sum()
+        self.stat_sum_episode_length += (~dropped).sum()
+        self.env_evaluated += dropped.sum()
+        if self.env_evaluated > 0:
+            tprint(
+                f'progress {self.env_evaluated} / {self.max_evaluate_envs} | '
+                f'reward: {self.stat_sum_rewards / self.env_evaluated:.2f} | '
+                f'eps length: {self.stat_sum_episode_length / self.env_evaluated:.2f} | '
+                f'rotate reward: {self.stat_sum_rotate_rewards / self.env_evaluated:.2f} | '
+                f'lin vel (x100): '
+                f'{self.stat_sum_obj_linvel * 100 / self.stat_sum_episode_length:.4f} | '
+                f'command torque: {self.stat_sum_torques / self.stat_sum_episode_length:.2f}')
 
-        if self.viewer and self.debug_viz:
-            # draw axes on target object
-            self.gym.clear_lines(self.viewer)
-            self.gym.refresh_rigid_body_state_tensor(self.sim)
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """IsaacGym merged these into one reset_buf; gymnasium wants them apart.
 
-            for i in range(self.num_envs):
-                objectx = (self.object_pos[i] + quat_apply(self.object_rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
-                objecty = (self.object_pos[i] + quat_apply(self.object_rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
-                objectz = (self.object_pos[i] + quat_apply(self.object_rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
+        Keeping them separate is what lets PPO bootstrap the value function through a
+        timeout without treating it as a real terminal state.
+        """
+        dropped = torch.less(self.object_pos[:, -1], self.reset_z_threshold)
+        timed_out = self.episode_length_buf >= self.max_episode_length - 1
+        return dropped, timed_out
 
-                p0 = self.object_pos[i].cpu().numpy()
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], objectx[0], objectx[1], objectx[2]], [0.85, 0.1, 0.1])
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], objecty[0], objecty[1], objecty[2]], [0.1, 0.85, 0.1])
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], objectz[0], objectz[1], objectz[2]], [0.1, 0.1, 0.85])
+    # ------------------------------------------------------------------ reset
 
-    def _create_ground_plane(self):
-        plane_params = gymapi.PlaneParams()
-        plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
-        self.gym.add_ground(self.sim, plane_params)
+    def _reset_idx(self, env_ids):
+        if env_ids is None:
+            env_ids = self.hand._ALL_INDICES
+        super()._reset_idx(env_ids)
 
-    def pre_physics_step(self, actions):
-        self.actions = actions.clone().to(self.device)
-        targets = self.prev_targets + 1 / 24 * self.actions
-        self.cur_targets[:] = tensor_clamp(targets, self.allegro_hand_dof_lower_limits, self.allegro_hand_dof_upper_limits)
-        self.prev_targets[:] = self.cur_targets.clone()
-        self.object_rot_prev[:] = self.object_rot
-        self.object_pos_prev[:] = self.object_pos
+        if self.randomize_pd_gains:
+            self.p_gain[env_ids] = torch_rand_float(
+                self.randomize_p_gain_lower, self.randomize_p_gain_upper,
+                (len(env_ids), self.num_actions), device=self.device)
+            self.d_gain[env_ids] = torch_rand_float(
+                self.randomize_d_gain_lower, self.randomize_d_gain_upper,
+                (len(env_ids), self.num_actions), device=self.device)
 
-        if self.force_scale > 0.0:
-            self.rb_forces *= torch.pow(self.force_decay, self.dt / self.force_decay_interval)
-            # apply new forces
-            obj_mass = to_torch(
-                [self.gym.get_actor_rigid_body_properties(env, self.gym.find_actor_handle(env, 'object'))[0].mass for
-                 env in self.envs], device=self.device)
-            prob = self.random_force_prob_scalar
-            force_indices = (torch.less(torch.rand(self.num_envs, device=self.device), prob)).nonzero()
-            self.rb_forces[force_indices, self.object_rb_handles, :] = torch.randn(
-                self.rb_forces[force_indices, self.object_rb_handles, :].shape,
-                device=self.device) * obj_mass[force_indices, None] * self.force_scale
-            self.gym.apply_rigid_body_force_tensors(self.sim, gymtorch.unwrap_tensor(self.rb_forces), None, gymapi.ENV_SPACE)
+        scales = self.randomize_scale_list if self.randomize_scale else [self.base_obj_scale]
+        num_scales = len(scales)
+        for n_s, obj_scale in enumerate(scales):
+            s_ids = env_ids[(env_ids % num_scales == n_s).nonzero(as_tuple=False).squeeze(-1)]
+            if len(s_ids) == 0:
+                continue
+            cache = self.saved_grasping_states[str(obj_scale)]
+            sampled = cache[torch.randint(cache.shape[0], (len(s_ids),), device=self.device)]
 
-    def reset(self):
-        super().reset()
-        self.obs_dict['priv_info'] = self.priv_info_buf.to(self.rl_device)
-        self.obs_dict['proprio_hist'] = self.proprio_hist_buf.to(self.rl_device)
-        return self.obs_dict
+            root_state = self.object.data.default_root_state[s_ids].clone()
+            root_state[:, 0:3] = sampled[:, 16:19] + self.scene.env_origins[s_ids]
+            root_state[:, 3:7] = sampled[:, 19:23]
+            root_state[:, 7:13] = 0
+            self.object.write_root_state_to_sim(root_state, env_ids=s_ids)
 
-    def step(self, actions):
-        super().step(actions)
-        self.obs_dict['priv_info'] = self.priv_info_buf.to(self.rl_device)
-        self.obs_dict['proprio_hist'] = self.proprio_hist_buf.to(self.rl_device)
-        return self.obs_dict, self.rew_buf, self.reset_buf, self.extras
+            pos = sampled[:, :16]
+            self.hand.write_joint_state_to_sim(
+                pos, torch.zeros_like(pos), joint_ids=self._joint_idx, env_ids=s_ids)
+            self.prev_targets[s_ids] = pos
+            self.cur_targets[s_ids] = pos
+            self.init_pose_buf[s_ids] = pos.clone()
+            self._update_priv_buf(s_ids, 'obj_scale', obj_scale)
 
-    def update_low_level_control(self):
-        previous_dof_pos = self.allegro_hand_dof_pos.clone()
-        self._refresh_gym()
-        if self.torque_control:
-            dof_pos = self.allegro_hand_dof_pos
-            dof_vel = (dof_pos - previous_dof_pos) / self.dt
-            self.dof_vel_finite_diff = dof_vel.clone()
-            torques = self.p_gain * (self.cur_targets - dof_pos) - self.d_gain * dof_vel
-            self.torques = torch.clip(torques, -0.5, 0.5).clone()
-            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
-        else:
-            self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.cur_targets))
+        if not self.torque_control:
+            self.hand.set_joint_position_target(
+                self.prev_targets[env_ids], joint_ids=self._joint_idx, env_ids=env_ids)
 
-    def check_termination(self, object_pos):
-        resets = torch.logical_or(
-            torch.less(object_pos[:, -1], self.reset_z_threshold),
-            torch.greater_equal(self.progress_buf, self.max_episode_length),
-        )
-        return resets
+        self._obs[env_ids] = 0
+        self.obs_buf_lag_history[env_ids] = 0
+        self.rb_forces[env_ids] = 0
+        self.priv_info_buf[env_ids, 0:3] = 0
+        self.proprio_hist_buf[env_ids] = 0
+        self.at_reset_buf[env_ids] = 1
 
-    def _refresh_gym(self):
-        self.gym.refresh_dof_state_tensor(self.sim)
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-        self.gym.refresh_net_contact_force_tensor(self.sim)
-        self.object_pose = self.root_state_tensor[self.object_indices, 0:7]
-        self.object_pos = self.root_state_tensor[self.object_indices, 0:3]
-        self.object_rot = self.root_state_tensor[self.object_indices, 3:7]
-        self.object_linvel = self.root_state_tensor[self.object_indices, 7:10]
-        self.object_angvel = self.root_state_tensor[self.object_indices, 10:13]
+    # ------------------------------------------------------------------ config plumbing
 
     def _setup_domain_rand_config(self, rand_config):
         self.randomize_mass = rand_config['randomizeMass']
@@ -477,8 +426,6 @@ class AllegroHandHora(VecTask):
         self.randomize_scale = rand_config['randomizeScale']
         self.scale_list_init = rand_config['scaleListInit']
         self.randomize_scale_list = rand_config['randomizeScaleList']
-        self.randomize_scale_lower = rand_config['randomizeScaleLower']
-        self.randomize_scale_upper = rand_config['randomizeScaleUpper']
         self.randomize_pd_gains = rand_config['randomizePDGains']
         self.randomize_p_gain_lower = rand_config['randomizePGainLower']
         self.randomize_p_gain_upper = rand_config['randomizePGainUpper']
@@ -493,65 +440,6 @@ class AllegroHandHora(VecTask):
         self.enable_priv_obj_com = p_config['enableObjCOM']
         self.enable_priv_obj_friction = p_config['enableObjFriction']
 
-    def _update_priv_buf(self, env_id, name, value, lower=None, upper=None):
-        # normalize to -1, 1
-        s, e = self.priv_info_dict[name]
-        if eval(f'self.enable_priv_{name}'):
-            if type(value) is list:
-                value = to_torch(value, dtype=torch.float, device=self.device)
-            if type(lower) is list or upper is list:
-                lower = to_torch(lower, dtype=torch.float, device=self.device)
-                upper = to_torch(upper, dtype=torch.float, device=self.device)
-            if lower is not None and upper is not None:
-                value = (2.0 * value - upper - lower) / (upper - lower)
-            self.priv_info_buf[env_id, s:e] = value
-        else:
-            self.priv_info_buf[env_id, s:e] = 0
-
-    def _setup_object_info(self, o_config):
-        self.object_type = o_config['type']
-        raw_prob = o_config['sampleProb']
-        assert (sum(raw_prob) == 1)
-
-        primitive_list = self.object_type.split('+')
-        print('---- Primitive List ----')
-        print(primitive_list)
-        self.object_type_prob = []
-        self.object_type_list = []
-        self.asset_files_dict = {
-            'simple_tennis_ball': 'assets/ball.urdf',
-        }
-        for p_id, prim in enumerate(primitive_list):
-            if 'cuboid' in prim:
-                subset_name = self.object_type.split('_')[-1]
-                cuboids = sorted(glob(f'../assets/cuboid/{subset_name}/*.urdf'))
-                cuboid_list = [f'cuboid_{i}' for i in range(len(cuboids))]
-                self.object_type_list += cuboid_list
-                for i, name in enumerate(cuboids):
-                    self.asset_files_dict[f'cuboid_{i}'] = name.replace('../assets/', '')
-                self.object_type_prob += [raw_prob[p_id] / len(cuboid_list) for _ in cuboid_list]
-            elif 'cylinder' in prim:
-                subset_name = self.object_type.split('_')[-1]
-                cylinders = sorted(glob(f'assets/cylinder/{subset_name}/*.urdf'))
-                cylinder_list = [f'cylinder_{i}' for i in range(len(cylinders))]
-                self.object_type_list += cylinder_list
-                for i, name in enumerate(cylinders):
-                    self.asset_files_dict[f'cylinder_{i}'] = name.replace('../assets/', '')
-                self.object_type_prob += [raw_prob[p_id] / len(cylinder_list) for _ in cylinder_list]
-            else:
-                self.object_type_list += [prim]
-                self.object_type_prob += [raw_prob[p_id]]
-        print('---- Object List ----')
-        print(self.object_type_list)
-        assert (len(self.object_type_list) == len(self.object_type_prob))
-
-    def _allocate_task_buffer(self, num_envs):
-        # extra buffers for observe randomized params
-        self.prop_hist_len = self.config['env']['hora']['propHistoryLen']
-        self.num_env_factors = self.config['env']['hora']['privInfoDim']
-        self.priv_info_buf = torch.zeros((num_envs, self.num_env_factors), device=self.device, dtype=torch.float)
-        self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, 32), device=self.device, dtype=torch.float)
-
     def _setup_reward_config(self, r_config):
         self.angvel_clip_min = r_config['angvelClipMin']
         self.angvel_clip_max = r_config['angvelClipMax']
@@ -561,103 +449,16 @@ class AllegroHandHora(VecTask):
         self.torque_penalty_scale = r_config['torquePenaltyScale']
         self.work_penalty_scale = r_config['workPenaltyScale']
 
-    def _create_object_asset(self):
-        # object file to asset
-        asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../')
-        hand_asset_file = self.config['env']['asset']['handAsset']
-        # load hand asset
-        hand_asset_options = gymapi.AssetOptions()
-        hand_asset_options.flip_visual_attachments = False
-        hand_asset_options.fix_base_link = True
-        hand_asset_options.collapse_fixed_joints = True
-        hand_asset_options.disable_gravity = True
-        hand_asset_options.thickness = 0.001
-        hand_asset_options.angular_damping = 0.01
 
-        if self.torque_control:
-            hand_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
-        else:
-            hand_asset_options.default_dof_drive_mode = gymapi.DOF_MODE_POS
-        self.hand_asset = self.gym.load_asset(self.sim, asset_root, hand_asset_file, hand_asset_options)
-
-        # load object asset
-        self.object_asset_list = []
-        for object_type in self.object_type_list:
-            object_asset_file = self.asset_files_dict[object_type]
-            object_asset_options = gymapi.AssetOptions()
-            object_asset = self.gym.load_asset(self.sim, asset_root, object_asset_file, object_asset_options)
-            self.object_asset_list.append(object_asset)
-
-    def _init_object_pose(self):
-        allegro_hand_start_pose = gymapi.Transform()
-        allegro_hand_start_pose.p = gymapi.Vec3(0, 0, 0.5)
-        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(
-            gymapi.Vec3(0, 1, 0), -np.pi / 2) * gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi / 2)
-        object_start_pose = gymapi.Transform()
-        object_start_pose.p = gymapi.Vec3()
-        object_start_pose.p.x = allegro_hand_start_pose.p.x
-        pose_dx, pose_dy, pose_dz = -0.01, -0.04, 0.15
-
-        object_start_pose.p.x = allegro_hand_start_pose.p.x + pose_dx
-        object_start_pose.p.y = allegro_hand_start_pose.p.y + pose_dy
-        object_start_pose.p.z = allegro_hand_start_pose.p.z + pose_dz
-
-        object_start_pose.p.y = allegro_hand_start_pose.p.y - 0.01
-        # for grasp pose generation, it is used to initialize the object
-        # it should be slightly higher than the fingertip
-        # so it is set to be 0.66 for internal allegro and 0.64 for the public allegro
-        # ----
-        # for in-hand object rotation, the initialization of z is only used in the first step
-        # it is set to be 0.65 for backward compatibility
-        object_z = 0.66 if self.save_init_pose else 0.65
-        if 'internal' not in self.grasp_cache_name:
-            object_z -= 0.02
-        object_start_pose.p.z = object_z
-        return allegro_hand_start_pose, object_start_pose
+def _dome_light_cfg():
+    import isaaclab.sim as sim_utils
+    return sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
 
 
-def compute_hand_reward(
-    object_linvel_penalty, object_linvel_penalty_scale: float,
-    rotate_reward, rotate_reward_scale: float,
-    pose_diff_penalty, pose_diff_penalty_scale: float,
-    torque_penalty, torque_pscale: float,
-    work_penalty, work_pscale: float,
-):
-    reward = rotate_reward_scale * rotate_reward
-    # Distance from the hand to the object
-    reward = reward + object_linvel_penalty * object_linvel_penalty_scale
-    reward = reward + pose_diff_penalty * pose_diff_penalty_scale
-    reward = reward + torque_penalty * torque_pscale
-    reward = reward + work_penalty * work_pscale
-    return reward
+def spawn_ground_plane(env):
+    import isaaclab.sim as sim_utils
+    cfg = sim_utils.GroundPlaneCfg()
+    cfg.func('/World/ground', cfg)
 
 
-def quat_to_axis_angle(quaternions: torch.Tensor) -> torch.Tensor:
-    """
-    Convert rotations given as quaternions to axis/angle.
-    Adapted from PyTorch3D:
-    https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/transforms/rotation_conversions.html#quaternion_to_axis_angle
-    Args:
-        quaternions: quaternions with real part last,
-            as tensor of shape (..., 4).
-    Returns:
-        Rotations given as a vector in axis angle form, as a tensor
-            of shape (..., 3), where the magnitude is the angle
-            turned anticlockwise in radians around the vector's
-            direction.
-    """
-    norms = torch.norm(quaternions[..., :3], p=2, dim=-1, keepdim=True)
-    half_angles = torch.atan2(norms, quaternions[..., 3:])
-    angles = 2 * half_angles
-    eps = 1e-6
-    small_angles = angles.abs() < eps
-    sin_half_angles_over_angles = torch.empty_like(angles)
-    sin_half_angles_over_angles[~small_angles] = (
-        torch.sin(half_angles[~small_angles]) / angles[~small_angles]
-    )
-    # for x small, sin(x/2) is about x/2 - (x/2)^3/6
-    # so sin(x/2)/x is about 1/2 - (x*x)/48
-    sin_half_angles_over_angles[small_angles] = (
-        0.5 - (angles[small_angles] * angles[small_angles]) / 48
-    )
-    return quaternions[..., :3] / sin_half_angles_over_angles
+__all__ = ['AllegroHandHora', 'gym']

@@ -56,7 +56,7 @@ everything else); M2 turns on multi-scale and eats the construction cost.
 | M | Goal | Exit criterion |
 |---|---|---|
 | M0 | Env + assets ready ✅ **done** | `assets/usd/` populated (96/96); IsaacLab 2.3.1 installed in `env_isaaclab`; `verify_hand_asset.py` passes |
-| M1 | Core env ports, single scale, no ROS | `train.py` runs stage 1 PPO; reward curve rises |
+| M1 | Core env ports, single scale, no ROS ✅ **done** | `train.py` runs stage 1 PPO; reward curve rises |
 | M2 | Domain randomization + multi-scale | Stage 1 parity with published HORA results |
 | M3 | Grasp generation | `gen_grasp.py` regenerates the 9 caches |
 | M4 | ROS 2 sim-in-the-loop | `deploy.py` drives sim through ros2_control, unmodified |
@@ -368,6 +368,33 @@ Remove `gym`, `tensorboardx`. This file now describes the **container** (deploy)
 the host env is `environment_isaaclab.yaml`. Worth a comment saying so.
 
 ---
+
+### M1 findings
+
+**1. `DirectRLEnv` owns `self.obs_buf`.** `step()` assigns the dict returned by
+`_get_observations()` to it, so hora's flat observation tensor of the same name was
+silently replaced with a dict on the first step. Renamed to `self._obs`. Worth checking
+any other buffer name the port carries over against the base class.
+
+**2. A raw dict cannot be a `@configclass` field.** Storing hora's hydra config dict on
+the env cfg sends `configclass`'s recursive validator into a ~1000-frame `RecursionError`.
+The dict is passed to the env constructor as a separate argument instead.
+
+**3. Overlapping joint-name patterns are rejected.** `{'joint_12_0': 0.263, '.*': 0.0}`
+fails with "Multiple matches". Initial joint positions are now derived by clamping 0.0
+into each joint's URDF limits (`_default_joint_pos`), which is also the honest fix for
+finding M0-4 rather than hardcoding the thumb exception.
+
+**4. Shutdown bites here too, and worse.** `simulation_app.close()` hung after training
+completed — three 10-minute test runs that were really 13 seconds of work plus a hung
+shutdown. Because `close()` blocks, any exit-code handling placed *after* it never runs,
+so the earlier "flush then `os._exit`" guard was dead code. `train.py` now skips `close()`
+entirely; `PPO.train()` flushes the tensorboard writer so nothing is lost.
+
+**5. Trainers moved to the gymnasium API.** `reset()` returns `(obs, info)` and `step()`
+returns the 5-tuple with `terminated`/`truncated` separate. Eight call sites across
+`ppo.py` and `padapt.py`. `_get_observations` returns `'policy'` (the IsaacLab contract)
+and `'obs'` (what hora's trainers read) pointing at the same tensor.
 
 ## M2 — Domain randomization and multi-scale
 
