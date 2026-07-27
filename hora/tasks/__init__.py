@@ -17,6 +17,8 @@ Importing this module requires a running Isaac Sim app -- ``isaaclab`` pulls in 
 Call ``AppLauncher`` before importing.
 """
 
+from hora.tasks.allegro_hand_grasp import AllegroHandGrasp
+from hora.tasks.allegro_hand_grasp_cfg import AllegroHandGraspEnvCfg, make_grasp_env_cfg
 from hora.tasks.allegro_hand_hora import AllegroHandHora
 from hora.tasks.allegro_hand_hora_cfg import AllegroHandHoraEnvCfg, make_env_cfg
 
@@ -24,16 +26,14 @@ from hora.tasks.allegro_hand_hora_cfg import AllegroHandHoraEnvCfg, make_env_cfg
 isaaclab_task_map = {
     'AllegroHandHora': (AllegroHandHora, make_env_cfg),
     'PublicAllegroHandHora': (AllegroHandHora, make_env_cfg),
+    'AllegroHandGrasp': (AllegroHandGrasp, make_grasp_env_cfg),
+    'PublicAllegroHandGrasp': (AllegroHandGrasp, make_grasp_env_cfg),
 }
 
 
 def make_task(task_name: str, task_cfg: dict, num_envs=None, render_mode=None):
     """Build a task env from hora's hydra ``task`` config dict."""
     if task_name not in isaaclab_task_map:
-        if 'Grasp' in task_name:
-            raise NotImplementedError(
-                f'{task_name} needs contact sensing, which is M3 of the migration '
-                '(see docs/isaaclab_migration.md).')
         raise KeyError(f'unknown task {task_name!r}; known: {sorted(isaaclab_task_map)}')
     env_cls, cfg_factory = isaaclab_task_map[task_name]
     return env_cls(cfg_factory(task_cfg, num_envs=num_envs), task_cfg,
@@ -55,5 +55,6 @@ def register_gym_envs():
         )
 
 
-__all__ = ['AllegroHandHora', 'AllegroHandHoraEnvCfg', 'make_env_cfg', 'make_task',
-           'isaaclab_task_map', 'register_gym_envs']
+__all__ = ['AllegroHandHora', 'AllegroHandHoraEnvCfg', 'make_env_cfg',
+           'AllegroHandGrasp', 'AllegroHandGraspEnvCfg', 'make_grasp_env_cfg',
+           'make_task', 'isaaclab_task_map', 'register_gym_envs']

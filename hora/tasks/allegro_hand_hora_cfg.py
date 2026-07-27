@@ -246,12 +246,25 @@ def make_env_cfg(task_cfg: dict, num_envs: int | None = None) -> AllegroHandHora
     cfg.object_cfg = RigidObjectCfg(
         prim_path='/World/envs/env_.*/object',
         spawn=spawn_cfg,
-        # z here only matters for the very first step -- reset overwrites it from the
-        # grasp cache. 0.65 kept for parity with the IsaacGym _init_object_pose.
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(-0.01, -0.01, 0.65), rot=(1.0, 0.0, 0.0, 0.0)),
+            pos=(-0.01, -0.01, _object_start_z(env)), rot=(1.0, 0.0, 0.0, 0.0)),
     )
     return cfg
+
+
+def _object_start_z(env: dict) -> float:
+    """Object spawn height, following the IsaacGym _init_object_pose.
+
+    For in-hand rotation this only matters on the very first step -- reset overwrites it
+    from the grasp cache. For grasp *generation* it is load-bearing: the object has to
+    start just above the fingertips so the closing hand can catch it. Starting it at the
+    rotation task's height leaves it below reset_height_threshold almost immediately, so
+    every env fails on step one and no poses are ever collected.
+    """
+    z = 0.66 if env['genGrasps'] else 0.65
+    if 'internal' not in env['grasp_cache_name']:
+        z -= 0.02
+    return z
 
 
 def _object_assets(object_type: str) -> list[str]:

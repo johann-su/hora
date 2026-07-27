@@ -58,12 +58,12 @@ everything else); M2 turns on multi-scale and eats the construction cost.
 | M0 | Env + assets ready ✅ **done** | `assets/usd/` populated (96/96); IsaacLab 2.3.1 installed in `env_isaaclab`; `verify_hand_asset.py` passes |
 | M1 | Core env ports, single scale, no ROS ✅ **done** | `train.py` runs stage 1 PPO; reward curve rises |
 | M2 | Domain randomization + multi-scale ✅ **done** | `train_s1.sh` runs unmodified; per-env scale/mass/CoM/friction verified |
-| M3 | Grasp generation | `gen_grasp.py` regenerates the 9 caches |
+| M3 | Grasp generation ⚠️ **partial** | `gen_grasp.py` regenerates the 9 caches |
 | M4 | ROS 2 sim-in-the-loop | `deploy.py` drives sim through ros2_control, unmodified |
 
 M3 depends on M0 only, so it can run in parallel with M1/M2 if the caches must be
-regenerated early. Note `cache/` is currently **empty** — either re-download the published
-caches or finish M3 before M2 can be validated.
+regenerated early. The published caches are downloaded (26 files, every scale in
+`randomizeScaleList`), so M1/M2 train without needing M3 finished.
 
 ---
 
@@ -491,11 +491,72 @@ Cfg with the contact sensors added and randomization mostly disabled, mirroring
 
 ### `gen_grasp.py` — MODIFY
 
-Same `AppLauncher` treatment as `train.py`. Saves with the M2 loader's conventions
-(wxyz quats) — and bump the filename or add a header field so old xyzw caches cannot be
-loaded by mistake.
+Same `AppLauncher` treatment as `train.py`. `--report-contact-forces` samples the
+fingertip/object force distribution instead of collecting, which is how the contact
+threshold gets calibrated rather than guessed.
+
+**On-disk format deliberately unchanged.** An earlier draft of this plan proposed writing
+wxyz quaternions and renaming the files. That was the wrong call: keeping the published
+**xyzw** layout means generated and downloaded caches stay interchangeable, and there is
+one conversion point (`_load_grasp_cache`) instead of two formats in circulation.
+
+### `scripts/validate_grasp_cache.py` — NEW
+
+The exit criterion for M3. Statistics alone cannot settle whether a generated cache is
+usable — two caches can have similar joint histograms and still differ in whether the
+poses actually hold the object. So the load-bearing check is functional: reset the
+rotation env from the cache, step with zero actions, and measure how many envs still hold
+the object. Zero actions means anything that survives is the grasp itself, not a policy.
+
+One cache per invocation (`SimulationContext` cannot be rebuilt in-process, M0 finding 5);
+run it twice and compare.
+
+**Published-cache baseline** (scale 0.8, 512 envs, 100 steps): fingertip-object distance
+0.0845 m at reset, object z 0.6519, and **held = 1.000 at every step**. A generated cache
+should reproduce that.
 
 ---
+
+### M3 findings
+
+**Status: the machinery works, the yield is not yet validated.** Contact sensing,
+filtering, collection and cache writing all run; a 1024-env run collected 7,431 / 50,000
+poses in ~7 minutes (so a full cache is roughly 45-60 min). What has *not* been checked is
+whether the generated poses are equivalent to the published ones — that comparison is the
+real exit criterion and is still open.
+
+**The contact filter must name the rigid body, not the spawn path.** The URDF importer
+wraps each link in an Xform, so the USD default prim is `/ball` and the body is at
+`/ball/ball`; spawning at `.../object` puts the body at `.../object/<link_name>`.
+Filtering on `.../object` yields a valid-but-empty pair set, so `force_matrix_w` is
+**all zeros forever rather than None** — indistinguishable from "nothing is touching".
+PhysX does warn (`GPU contact filter for collider ... is not supported`), but it is one
+line in thousands of startup messages. Grep for it when filtered contacts read as zero.
+
+**Contact needs a settling period that the original did not.** IsaacGym reset an env the
+instant its three conditions stopped holding, which only works if the object is already
+touching the fingers at spawn. The converted colliders differ enough that the object
+spawns ~1 cm clear, so it failed on step 1, was teleported back, and *never moved* —
+object z was identical to the spawn height on every step of a 200-step run.
+`graspSettleSteps` (default 10) suppresses failure while the object drops in.
+
+**The force threshold is calibrated, not guessed.** Measured fingertip/object contact
+forces run p05 0.068 N, p50 0.40 N, p99 2.44 N. The default is 0.1 N — above the noise
+floor, keeping ~93% of real contacts. An initial guess of 0.5 N sat above the *median*
+and discarded most genuine contacts. Re-measure with
+`gen_grasp.py --report-contact-forces` if the hand, objects or gains change.
+
+**Filtered contacts need `replicate_physics=False`**, so grasp generation does not get
+M2's replicated fast path.
+
+**Hand orientation is confirmed correct.** `rot=(0.5, 0.5, -0.5, 0.5)` was carried
+through M1/M2 unverified. Two independent checks now agree: a Kabsch solve recovering the
+rotation from the grasp cache returns the same quaternion (residual 0.0659 vs 0.0672 m,
+i.e. no improvement available), and the GUI shows the hand palm-up in a natural cupped
+pose. The ~8 cm fingertip-to-object distance seen when replaying cached grasps is
+body-origin to object-centre, not a surface gap — the merged `_tip` links put each
+fingertip body's origin well behind its contact surface, which is why IsaacGym's own
+condition used a generous 0.1 m.
 
 ## M4 — ROS 2 sim-in-the-loop
 

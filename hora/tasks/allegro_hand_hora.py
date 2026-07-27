@@ -104,6 +104,8 @@ class AllegroHandHora(DirectRLEnv):
         self.object = RigidObject(self.cfg.object_cfg)
 
         spawn_ground_plane(self)
+        # Sensors must exist before cloning, so subclasses get their hook here.
+        self._setup_extra_sensors()
 
         # Only clone here on the replicate_physics path, where clones are cheap USD
         # references into a single prototype.
@@ -121,6 +123,9 @@ class AllegroHandHora(DirectRLEnv):
 
         light_cfg = _dome_light_cfg()
         light_cfg.func('/World/Light', light_cfg)
+
+    def _setup_extra_sensors(self):
+        """Hook for subclasses to register sensors. Called before env cloning."""
 
     def _allocate_buffers(self):
         n, device = self.num_envs, self.device
@@ -173,10 +178,16 @@ class AllegroHandHora(DirectRLEnv):
         columns are already in hora order (verified against the thumb's strictly-positive
         joint_12_0 range).
         """
-        scales = self.cfg.object_scales
         self.saved_grasping_states = {}
+        if self.save_init_pose:
+            # genGrasps=True means we are generating the cache, not consuming it.
+            return
+        scales = self.cfg.object_scales
+        cache_dir = str(self.task_cfg['env'].get('graspCacheDir', 'cache'))
         for s in scales:
-            name = f'cache/{self.grasp_cache_name}_grasp_50k_s{str(s).replace(".", "")}.npy'
+            name = os.path.join(
+                cache_dir,
+                f'{self.grasp_cache_name}_grasp_50k_s{str(s).replace(".", "")}.npy')
             if not os.path.isfile(name):
                 raise FileNotFoundError(
                     f'grasp cache not found: {name}\n'
