@@ -1,4 +1,19 @@
+# Host-side environment for training and sim evaluation.
+#
+# This env runs IsaacLab; it has no ROS 2 in it and does not need any. The ROS 2
+# side (hardware deployment) lives in the devcontainer and has its own deps --
+# see .devcontainer/ and requirements.txt.
+#
+# Isaac Sim is installed from pip, IsaacLab from source. See docs/isaaclab_migration.md
+# for why source rather than `pip install isaaclab`: the Allegro reference envs, the
+# URDF->USD conversion tooling, and patchability all need the repo.
+#
 # Based on: https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/pip_installation.html
+#
+# After creating this env, install IsaacLab into it (v2.3.x pairs with Isaac Sim 5.1):
+#   git clone https://github.com/isaac-sim/IsaacLab.git ~/code/IsaacLab
+#   cd ~/code/IsaacLab && git checkout v2.3.1
+#   ./isaaclab.sh -i none      # 'none' -> skip rl_games/rsl_rl/skrl/sb3; hora has its own PPO
 name: env_isaaclab
 channels:
   - defaults
@@ -11,3 +26,7 @@ dependencies:
       - --extra-index-url https://download.pytorch.org/whl/cu128
       - torch==2.7.0
       - torchvision==0.22.0
+      # hora's own deps. hydra-core, omegaconf and tensorboard arrive via IsaacLab /
+      # Isaac Sim, so only termcolor is genuinely missing. Deliberately NO `gym`:
+      # IsaacLab is gymnasium-native and hora no longer imports gym anywhere.
+      - termcolor

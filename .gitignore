@@ -21,3 +21,7 @@ cach
 build
 install
 log
+# IsaacLab migration (M0): generated USD assets.
+# Reproducible from assets/*.urdf via scripts/convert_assets.sh.
+assets/usd/
+cache

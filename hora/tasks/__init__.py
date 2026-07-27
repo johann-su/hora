@@ -1,39 +1,60 @@
-# Copyright (c) 2018-2021, NVIDIA Corporation
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-#    list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-#    this list of conditions and the following disclaimer in the documentation
-#    and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-#    contributors may be used to endorse or promote products derived from
-#    this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# --------------------------------------------------------
+# In-Hand Object Rotation via Rapid Motor Adaptation
+# https://arxiv.org/abs/2210.04887
+# Copyright (c) 2022 Haozhi Qi
+# Licensed under The MIT License [see LICENSE for details]
+# --------------------------------------------------------
+# Ported from IsaacGym to IsaacLab. See docs/isaaclab_migration.md.
+# --------------------------------------------------------
 
+"""Task registry.
 
-from hora.tasks.allegro_hand_hora import AllegroHandHora
+The tasks are registered with gymnasium for discoverability, but hora's entry points
+construct the env class directly: ``gymnasium.make`` wraps the env in order-enforcing
+wrappers that add nothing here, and hora's PPO drives the env itself.
+
+Importing this module requires a running Isaac Sim app -- ``isaaclab`` pulls in ``carb``.
+Call ``AppLauncher`` before importing.
+"""
+
 from hora.tasks.allegro_hand_grasp import AllegroHandGrasp
+from hora.tasks.allegro_hand_grasp_cfg import AllegroHandGraspEnvCfg, make_grasp_env_cfg
+from hora.tasks.allegro_hand_hora import AllegroHandHora
+from hora.tasks.allegro_hand_hora_cfg import AllegroHandHoraEnvCfg, make_env_cfg
 
-# Mappings from strings to environments
-isaacgym_task_map = {
-    'AllegroHandHora': AllegroHandHora,
-    'AllegroHandGrasp': AllegroHandGrasp,
-    'PublicAllegroHandHora': AllegroHandHora,
-    'PublicAllegroHandGrasp': AllegroHandGrasp,
+# Name -> (env class, cfg factory). Replaces IsaacGym's `isaacgym_task_map`.
+isaaclab_task_map = {
+    'AllegroHandHora': (AllegroHandHora, make_env_cfg),
+    'PublicAllegroHandHora': (AllegroHandHora, make_env_cfg),
+    'AllegroHandGrasp': (AllegroHandGrasp, make_grasp_env_cfg),
+    'PublicAllegroHandGrasp': (AllegroHandGrasp, make_grasp_env_cfg),
 }
+
+
+def make_task(task_name: str, task_cfg: dict, num_envs=None, render_mode=None):
+    """Build a task env from hora's hydra ``task`` config dict."""
+    if task_name not in isaaclab_task_map:
+        raise KeyError(f'unknown task {task_name!r}; known: {sorted(isaaclab_task_map)}')
+    env_cls, cfg_factory = isaaclab_task_map[task_name]
+    return env_cls(cfg_factory(task_cfg, num_envs=num_envs), task_cfg,
+                   render_mode=render_mode)
+
+
+def register_gym_envs():
+    """Register the tasks with gymnasium. Safe to call more than once."""
+    import gymnasium as gym
+    for name, (env_cls, _) in isaaclab_task_map.items():
+        env_id = f'Hora-{name}-v0'
+        if env_id in gym.registry:
+            continue
+        gym.register(
+            id=env_id,
+            entry_point='hora.tasks.allegro_hand_hora:AllegroHandHora',
+            disable_env_checker=True,
+            kwargs={'env_cfg_entry_point': AllegroHandHoraEnvCfg},
+        )
+
+
+__all__ = ['AllegroHandHora', 'AllegroHandHoraEnvCfg', 'make_env_cfg',
+           'AllegroHandGrasp', 'AllegroHandGraspEnvCfg', 'make_grasp_env_cfg',
+           'make_task', 'isaaclab_task_map', 'register_gym_envs']

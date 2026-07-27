@@ -21,6 +21,16 @@ env:
     dgain: 0.1
 
   genGrasps: False
+  # ---- grasp generation (M3). Only read by AllegroHandGrasp; harmless otherwise.
+  # Where cache files are written/read. Point elsewhere to validate generated output
+  # without clobbering the published caches.
+  graspCacheDir: 'cache'
+  # Fingertip/object contact force (N) above which a finger counts as touching.
+  # Calibrated from the measured distribution -- see gen_grasp.py --report-contact-forces.
+  contactForceThreshold: 0.1
+  # Steps at episode start during which failure is not evaluated, letting the object
+  # drop into the hand. The IsaacGym version needed none; the converted colliders do.
+  graspSettleSteps: 10
 
   clipObservations: 5.0
   clipActions: 1.0
