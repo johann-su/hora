@@ -17,6 +17,7 @@ form; :func:`make_env_cfg` does the translation.
 
 from __future__ import annotations
 
+import glob
 import os
 import xml.etree.ElementTree as ET
 
@@ -26,6 +27,7 @@ from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.sim.spawners.wrappers import MultiAssetSpawnerCfg
 from isaaclab.utils import configclass
 
 # Joint order the policy works in: index, THUMB, middle, ring, four joints each.
@@ -112,6 +114,11 @@ class AllegroHandHoraEnvCfg(DirectRLEnvCfg):
     robot_cfg: ArticulationCfg = None
     object_cfg: RigidObjectCfg = None
 
+    # Nominal object scales, in the order envs cycle through them: env i gets
+    # object_scales[i % len(object_scales)]. The grasp cache is keyed by these values,
+    # so this tuple is the single source of truth for the scale <-> cache pairing.
+    object_scales: tuple = (0.8,)
+
     # NOTE: hora's own hydra dict is deliberately NOT a field here. @configclass
     # deep-validates every field, and recursing through a large plain dict blows the
     # stack. The env takes it as a separate constructor argument instead.
@@ -144,16 +151,9 @@ def make_env_cfg(task_cfg: dict, num_envs: int | None = None) -> AllegroHandHora
     cfg.scene.num_envs = num_envs if num_envs is not None else env['numEnvs']
     cfg.scene.env_spacing = env['envSpacing']
 
-    # M1 supports a single object scale, which is what lets replicate_physics stay True
-    # (the fast cloning path). Per-env heterogeneous scale is M2 -- see "Decision 0" in
-    # docs/isaaclab_migration.md.
-    scale_list = rand['randomizeScaleList'] if rand['randomizeScale'] else [env['baseObjScale']]
-    if len(scale_list) > 1:
-        raise NotImplementedError(
-            f'multi-scale randomization ({len(scale_list)} scales) is M2 of the migration; '
-            'for M1 pass a single scale, e.g. '
-            'task.env.randomization.randomizeScale=False task.env.baseObjScale=0.8')
-    obj_scale = float(scale_list[0])
+    scale_list = [float(s) for s in
+                  (rand['randomizeScaleList'] if rand['randomizeScale'] else [env['baseObjScale']])]
+    cfg.object_scales = tuple(scale_list)
 
     # ---- hand -----------------------------------------------------------------------
     # Torque control: hora runs its own PD at sim rate in _apply_action, so the actuator
@@ -199,20 +199,53 @@ def make_env_cfg(task_cfg: dict, num_envs: int | None = None) -> AllegroHandHora
     )
 
     # ---- object ---------------------------------------------------------------------
-    object_type = env['object']['type']
+    # Object identity and scale are both per-env and both fixed at construction, so they
+    # are expressed as spawner variants rather than runtime randomization. Variants are
+    # ordered scale-minor:
+    #
+    #     variant c  ->  scale = scale_list[c % S],  asset = asset_list[c // S]
+    #
+    # MultiAssetSpawnerCfg with random_choice=False assigns variant (i % V) to env i, and
+    # because S divides V that collapses to scale_list[i % S] -- exactly the `i %
+    # num_scales` rule the IsaacGym code used, and the one _reset_idx relies on to pick
+    # the matching grasp cache.
+    asset_list = _object_assets(env['object']['type'])
+    n_scales = len(scale_list)
+    # Every variant spawns a prototype prim whether or not an env uses it, so cap the
+    # asset count at what this many envs can actually reach. Rounding up keeps S | V.
+    max_assets = max(1, -(-cfg.scene.num_envs // n_scales))
+    asset_list = asset_list[:max_assets]
+
+    rigid_props = sim_utils.RigidBodyPropertiesCfg(
+        disable_gravity=False,
+        max_depenetration_velocity=physx.get('max_depenetration_velocity', 1000.0),
+        solver_position_iteration_count=physx.get('num_position_iterations', 8),
+        solver_velocity_iteration_count=physx.get('num_velocity_iterations', 0),
+    )
+    variants = [
+        sim_utils.UsdFileCfg(
+            usd_path=_usd_path(asset), scale=(sc, sc, sc),
+            activate_contact_sensors=True, rigid_props=rigid_props)
+        for asset in asset_list for sc in scale_list
+    ]
+
+    if len(variants) == 1:
+        spawn_cfg = variants[0]
+    else:
+        # Per-env geometry means physics cannot be replicated from a single prototype.
+        # This is the cost of multi-scale: slower startup and a lower env ceiling.
+        cfg.scene.replicate_physics = False
+        # Fabric cloning must go too. It is faster, but the clones are not reachable
+        # through USD APIs -- and the multi-asset spawner finds its targets by matching
+        # USD prim paths, so with fabric on it saw only env_0 and spawned one object for
+        # the whole scene (num_instances=1 for N envs, property writes hitting env 0).
+        cfg.scene.clone_in_fabric = False
+        spawn_cfg = MultiAssetSpawnerCfg(
+            assets_cfg=variants, random_choice=False, activate_contact_sensors=True)
+
     cfg.object_cfg = RigidObjectCfg(
         prim_path='/World/envs/env_.*/object',
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=_usd_path(_object_asset(object_type)),
-            scale=(obj_scale, obj_scale, obj_scale),
-            activate_contact_sensors=True,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=False,
-                max_depenetration_velocity=physx.get('max_depenetration_velocity', 1000.0),
-                solver_position_iteration_count=physx.get('num_position_iterations', 8),
-                solver_velocity_iteration_count=physx.get('num_velocity_iterations', 0),
-            ),
-        ),
+        spawn=spawn_cfg,
         # z here only matters for the very first step -- reset overwrites it from the
         # grasp cache. 0.65 kept for parity with the IsaacGym _init_object_pose.
         init_state=RigidObjectCfg.InitialStateCfg(
@@ -221,12 +254,17 @@ def make_env_cfg(task_cfg: dict, num_envs: int | None = None) -> AllegroHandHora
     return cfg
 
 
-def _object_asset(object_type: str) -> str:
-    """Map hora's object type string onto a URDF path (converted to USD downstream).
+def _object_assets(object_type: str) -> list[str]:
+    """Map hora's object type string onto the URDF paths it draws from.
 
-    M1 handles the single-object types. The ``cuboid``/``cylinder`` families sample from
-    a directory of ~80 meshes per env, which needs the multi-asset spawner and therefore
-    lands with M2.
+    Mirrors ``_setup_object_info`` in the IsaacGym implementation: a bare name is a
+    single asset, while ``cuboid_<subset>`` / ``cylinder_<subset>`` enumerate a directory.
+
+    One deliberate behavioural difference: IsaacGym drew each env's object with
+    ``np.random.choice(..., p=sampleProb)``, whereas the multi-asset spawner assigns
+    round-robin. For the uniform weights hora actually uses these agree in distribution,
+    and round-robin additionally guarantees exact balance across envs. Non-uniform
+    ``sampleProb`` would need the list repeating in proportion.
     """
     simple = {
         'simple_tennis_ball': 'assets/ball.urdf',
@@ -236,7 +274,17 @@ def _object_asset(object_type: str) -> str:
         'ball': 'assets/ball.urdf',
     }
     if object_type in simple:
-        return simple[object_type]
-    raise NotImplementedError(
-        f"object type {object_type!r} samples from an asset family, which needs the "
-        f"multi-asset spawner (M2). For M1 use one of: {sorted(simple)}")
+        return [simple[object_type]]
+
+    for family in ('cuboid', 'cylinder'):
+        if object_type.startswith(family):
+            subset = object_type.split('_', 1)[1] if '_' in object_type else 'default'
+            pattern = os.path.join(REPO_ROOT, 'assets', family, subset, '*.urdf')
+            found = sorted(glob.glob(pattern))
+            if not found:
+                raise FileNotFoundError(f'no assets matched {pattern}')
+            return [os.path.relpath(f, REPO_ROOT) for f in found]
+
+    raise ValueError(
+        f"unknown object type {object_type!r}; expected one of {sorted(simple)} "
+        f"or a cuboid_<subset> / cylinder_<subset> family")

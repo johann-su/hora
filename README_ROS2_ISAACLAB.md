@@ -96,4 +96,12 @@ Set `ISAACLAB=` if the IsaacLab repo is not at `~/code/IsaacLab`.
 
 ## Train
 
+```bash
+# e.g. ./scripts/train_s1.sh 0 0 debug
+./scripts/train_s1.sh ${GPU_ID} ${SEED_ID} ${OUTPUT_NAME}
+```
 
+tensorboard
+```bash
+tensorboard --logdir=outputs/AllegroHandHora/debug
+```

@@ -57,7 +57,7 @@ everything else); M2 turns on multi-scale and eats the construction cost.
 |---|---|---|
 | M0 | Env + assets ready ✅ **done** | `assets/usd/` populated (96/96); IsaacLab 2.3.1 installed in `env_isaaclab`; `verify_hand_asset.py` passes |
 | M1 | Core env ports, single scale, no ROS ✅ **done** | `train.py` runs stage 1 PPO; reward curve rises |
-| M2 | Domain randomization + multi-scale | Stage 1 parity with published HORA results |
+| M2 | Domain randomization + multi-scale ✅ **done** | `train_s1.sh` runs unmodified; per-env scale/mass/CoM/friction verified |
 | M3 | Grasp generation | `gen_grasp.py` regenerates the 9 caches |
 | M4 | ROS 2 sim-in-the-loop | `deploy.py` drives sim through ros2_control, unmodified |
 
@@ -409,6 +409,50 @@ Per-env properties currently set inline in `_create_envs` move to `EventTermCfg`
 | PD gain randomization in `reset_idx` | keep in `_reset_idx`; it is plain tensor work |
 
 Then flip `replicate_physics=False` and enable the multi-asset spawner.
+
+### M2 findings
+
+**Performance cost is much smaller than feared.** At 1024 envs, 81 cuboids × 9 scales
+with full randomization runs at **15.7k FPS** against M1's single-scale, replicated
+**19.4k FPS** — roughly 19%, not the order of magnitude "Decision 0" braced for. The env
+ceiling on a 12 GB card is still the binding constraint, not `replicate_physics`.
+
+**`clone_in_fabric` must be off for heterogeneous scenes, and fails silently if not.**
+Fabric clones are not reachable through USD APIs, and the multi-asset spawner locates its
+targets by matching USD prim paths — so with fabric on it found only `env_0` and spawned
+one object for the entire scene. The symptom was `num_instances == 1` for 64 envs, i.e.
+every property write landing on env 0 while training carried on looking healthy. This is
+the most dangerous thing found in M2: nothing errors.
+
+**`clone_environments()` must be guarded on `replicate_physics`.** When it is False,
+`InteractiveScene.__init__` has *already* deep-cloned the env xforms — it must, so the
+`env_.*` paths exist before the spawner's regex runs. Calling it again from `_setup_scene`
+(as every replicated DirectRLEnv example does) undoes that.
+
+**A single-body `RigidObject` reports CoM as `(num_envs, 7)`**, not the
+`(num_envs, num_bodies, 7)` that IsaacLab's own `randomize_rigid_body_com` indexes —
+that term is written for articulations.
+
+**Randomization is applied by hand, not through `EventManager`.** hora's privileged
+observation must contain the *actual* sampled mass/CoM/friction, and event terms sample
+internally without reporting values back. `_randomize_object_properties` samples once at
+construction (matching IsaacGym, which randomized at env creation rather than per reset)
+and writes straight into `priv_info_buf`.
+
+**Object choice is round-robin, not weighted sampling.** IsaacGym drew each env's object
+with `np.random.choice(..., p=sampleProb)`; `MultiAssetSpawnerCfg(random_choice=False)`
+assigns cyclically. For the uniform weights hora uses these agree in distribution, and
+round-robin also guarantees exact balance. A non-uniform `sampleProb` would need the
+variant list repeated in proportion.
+
+**The ±0.025 scale jitter is not reproduced.** Envs get exactly the nine nominal scales.
+Restoring it means emitting more variants (9 × k, keeping the count a multiple of 9 so
+`i % 9` still selects the right grasp cache) — cheap, since variants are xform scales over
+one USD, but not currently done.
+
+**`train.py`'s overwrite guard blocks unattended runs.** Re-using an `output_name` that
+already holds `best.pth` prompts on stdin and waits forever. Worth knowing before queuing
+a long sweep.
 
 **Grasp cache loader.** `_reset_idx` reads `cache/{name}_grasp_50k_s{scale}.npy`,
 `[16 joint pos, 3 xyz, 4 quat_xyzw]`. Needs: quat → wxyz, joint order asserted against

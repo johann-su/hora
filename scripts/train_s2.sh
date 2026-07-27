@@ -1,4 +1,15 @@
 #!/bin/bash
+if [ $# -lt 3 ]; then
+    echo "usage: $0 <gpus> <seed> <cache_name> [extra hydra overrides]"
+    echo "  e.g.  $0 0 0 hora_v1"
+    echo
+    echo "All 3 arguments are required. In particular an empty <gpus> expands to"
+    echo "CUDA_VISIBLE_DEVICES= , which hides every GPU -- Isaac Sim then fails with"
+    echo "'no CUDA-capable device is detected', which looks like a broken driver but is not."
+    exit 1
+fi
+
+
 GPUS=$1
 SEED=$2
 CACHE=$3

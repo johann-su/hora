@@ -81,6 +81,7 @@ class AllegroHandHora(DirectRLEnv):
         self._resolve_joint_order()
         self._allocate_buffers()
         self._load_grasp_cache()
+        self._randomize_object_properties()
 
     # ------------------------------------------------------------------ setup
 
@@ -104,9 +105,17 @@ class AllegroHandHora(DirectRLEnv):
 
         spawn_ground_plane(self)
 
-        # copy_from_source=False keeps the clones as USD references into one source prim,
-        # which is what makes replicate_physics viable at this env count.
-        self.scene.clone_environments(copy_from_source=False)
+        # Only clone here on the replicate_physics path, where clones are cheap USD
+        # references into a single prototype.
+        #
+        # With replicate_physics=False (multi-scale / multi-asset), InteractiveScene has
+        # ALREADY deep-cloned the env xforms in its own __init__ -- it has to, so that
+        # every /World/envs/env_* path exists before the multi-asset spawner runs and its
+        # regex can match them all. Cloning again here left the object spawned into env_0
+        # only, and the physx view reported num_instances=1 for 64 envs: property writes
+        # silently applied to a single environment.
+        if self.cfg.scene.replicate_physics:
+            self.scene.clone_environments(copy_from_source=False)
         self.scene.articulations['hand'] = self.hand
         self.scene.rigid_objects['object'] = self.object
 
@@ -164,7 +173,7 @@ class AllegroHandHora(DirectRLEnv):
         columns are already in hora order (verified against the thumb's strictly-positive
         joint_12_0 range).
         """
-        scales = self.randomize_scale_list if self.randomize_scale else [self.base_obj_scale]
+        scales = self.cfg.object_scales
         self.saved_grasping_states = {}
         for s in scales:
             name = f'cache/{self.grasp_cache_name}_grasp_50k_s{str(s).replace(".", "")}.npy'
@@ -176,6 +185,64 @@ class AllegroHandHora(DirectRLEnv):
             data = torch.from_numpy(np.load(name)).float().to(self.device)
             data[:, 19:23] = quat_xyzw_to_wxyz(data[:, 19:23])
             self.saved_grasping_states[str(s)] = data
+
+    def _randomize_object_properties(self):
+        """Sample per-env mass, CoM and friction once, as the IsaacGym version did.
+
+        Done by hand rather than through EventManager terms for a specific reason: the
+        privileged-information buffer has to contain the *actual* sampled values, and an
+        event term samples internally without reporting back. Object scale is not here --
+        it is baked into the spawner variants at construction (see the cfg module).
+
+        These are all one-shot: hora randomizes at env creation, not on reset, so a
+        policy sees a fixed set of object properties for the whole run.
+        """
+        n = self.num_envs
+        cpu_ids = torch.arange(n, dtype=torch.long)
+
+        # ---- scale (already fixed by the spawner; recorded for priv_info) -----------
+        scales = torch.tensor(
+            [self.cfg.object_scales[i % len(self.cfg.object_scales)] for i in range(n)],
+            device=self.device)
+        self._update_priv_buf(slice(None), 'obj_scale', scales)
+
+        # ---- mass -------------------------------------------------------------------
+        masses = self.object.root_physx_view.get_masses().clone()
+        if self.randomize_mass:
+            masses[:, 0] = (torch.rand(n) *
+                            (self.randomize_mass_upper - self.randomize_mass_lower)
+                            + self.randomize_mass_lower)
+            self.object.root_physx_view.set_masses(masses, cpu_ids)
+        self._update_priv_buf(slice(None), 'obj_mass', masses[:, 0].to(self.device))
+
+        # ---- centre of mass ---------------------------------------------------------
+        # A single-body rigid object reports CoM as (num_envs, 7) -- position + quat --
+        # not the (num_envs, num_bodies, 7) that IsaacLab's articulation-oriented
+        # randomize_rigid_body_com assumes.
+        coms = self.object.root_physx_view.get_coms().clone()
+        if self.randomize_com:
+            coms[:, :3] = (torch.rand((n, 3)) *
+                           (self.randomize_com_upper - self.randomize_com_lower)
+                           + self.randomize_com_lower)
+            self.object.root_physx_view.set_coms(coms, cpu_ids)
+        self._update_priv_buf(slice(None), 'obj_com', coms[:, :3].to(self.device))
+
+        # ---- friction ---------------------------------------------------------------
+        # IsaacGym applied one sampled coefficient to *both* the hand and the object, so
+        # the contact pair sees a single friction value; keep that.
+        friction = torch.ones(n)
+        if self.randomize_friction:
+            friction = (torch.rand(n) *
+                        (self.randomize_friction_upper - self.randomize_friction_lower)
+                        + self.randomize_friction_lower)
+            for asset in (self.object, self.hand):
+                # (num_envs, num_shapes, 3) -> static friction, dynamic friction, restitution
+                mats = asset.root_physx_view.get_material_properties().clone()
+                mats[..., 0] = friction[:, None]
+                mats[..., 1] = friction[:, None]
+                asset.root_physx_view.set_material_properties(mats, cpu_ids)
+        self._update_priv_buf(slice(None), 'obj_friction', friction.to(self.device))
+
 
     # ------------------------------------------------------------------ properties
 
@@ -288,6 +355,11 @@ class AllegroHandHora(DirectRLEnv):
                 value = torch.tensor(value, dtype=torch.float, device=self.device)
             if lower is not None and upper is not None:
                 value = (2.0 * value - upper - lower) / (upper - lower)
+            # The scalar fields (obj_scale, obj_mass, obj_friction) occupy a 1-wide slice,
+            # so a per-env vector of shape (N,) has to grow a trailing dim to land in it.
+            # IsaacGym only ever wrote these one env at a time, where it broadcast.
+            if torch.is_tensor(value) and value.dim() == 1 and (e - s) == 1:
+                value = value.unsqueeze(-1)
             self.priv_info_buf[env_id, s:e] = value
         else:
             self.priv_info_buf[env_id, s:e] = 0
@@ -377,7 +449,7 @@ class AllegroHandHora(DirectRLEnv):
                 self.randomize_d_gain_lower, self.randomize_d_gain_upper,
                 (len(env_ids), self.num_actions), device=self.device)
 
-        scales = self.randomize_scale_list if self.randomize_scale else [self.base_obj_scale]
+        scales = self.cfg.object_scales
         num_scales = len(scales)
         for n_s, obj_scale in enumerate(scales):
             s_ids = env_ids[(env_ids % num_scales == n_s).nonzero(as_tuple=False).squeeze(-1)]
@@ -398,7 +470,6 @@ class AllegroHandHora(DirectRLEnv):
             self.prev_targets[s_ids] = pos
             self.cur_targets[s_ids] = pos
             self.init_pose_buf[s_ids] = pos.clone()
-            self._update_priv_buf(s_ids, 'obj_scale', obj_scale)
 
         if not self.torque_control:
             self.hand.set_joint_position_target(
