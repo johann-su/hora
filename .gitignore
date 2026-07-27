@@ -1,6 +1,5 @@
 *.egg-info
 /.vs
-/.vscode
 /_package
 /shaders
 ._tmptext.txt

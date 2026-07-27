@@ -36,9 +36,10 @@ colcon build --symlink-install
 (inside dev container - terminal 1): launch allegro hand controller
 ```bash
 ros2 launch allegro_hand_bringup allegro_hand.launch.py
+ros2 launch allegro_hand_bringup allegro_hand.launch.py ros2_control_hardware_type:=mock_components # run with no hardware connected
 ```
 
-(inside dev container - terminal 2): launch hora
+(inside dev container - terminal 2): run the hora policy
 ```bash
-python -m hora.algo.deploy.deploy ...
+./scripts/deploy.sh hora_v0.0.2
 ```

@@ -28,7 +28,16 @@
     "containerEnv": {
         "DISPLAY": "unix:0",
         "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
-        "ROS_DOMAIN_ID": "42"
+        "ROS_DOMAIN_ID": "42",
+        "NVIDIA_VISIBLE_DEVICES": "all",
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,graphics,utility"
+    },
+    // "optional" so the container still starts on machines without an NVIDIA
+    // GPU (mock_components testing); when one is present the tooling adds
+    // --gpus all, which injects the host driver libraries the torch policy
+    // needs. Requires nvidia-container-toolkit on the host.
+    "hostRequirements": {
+        "gpu": "optional"
     },
     "runArgs": [
         "--net=host",

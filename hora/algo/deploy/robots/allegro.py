@@ -17,6 +17,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import JointState
+from lifecycle_msgs.msg import TransitionEvent
 from controller_manager_msgs.srv import ListControllers, SwitchController
 from allegro_hand_control_msgs.action import GraspCommand
 
@@ -40,9 +41,12 @@ class Allegro(Node):
         through the controller_manager as needed.
 
         :param joint_prefix: Prefix of the hand joint names in the URDF
-        (default 'ah_', giving ah_joint00 .. ah_joint33). Command order
-        follows the controller configuration: finger-major, i.e.
-        joint00..03, joint10..13, joint20..23, joint30..33.
+        (default 'ah_', giving ah_joint00 .. ah_joint33). Positions and
+        commands crossing this interface are in allegro SDK order --
+        index, middle, ring, thumb, i.e. joint10..13, joint20..23,
+        joint30..33, joint00..03 -- matching the old ROS 1 joint_cmd
+        topic. Reordering to the controller's thumb-first joint order is
+        handled internally.
 
         :param namespace: Optional namespace of the controller_manager and
         controllers (e.g. 'right' for a duo-hand launch).
@@ -61,9 +65,28 @@ class Allegro(Node):
         super().__init__('allegro_client', namespace=namespace or None)
 
         self._num_joints = num_joints
+
+        # ros2_allegro names the thumb joint00..03 and the fingers
+        # joint10..33, so the URDF/controller order is thumb-first. The
+        # allegro SDK (and the old ROS 1 joint_cmd topic, which hora's
+        # observation/action remapping is written against) orders them
+        # index, middle, ring, thumb -- see sdk_ordered_joint_base_names in
+        # allegro_hand_hardwares/v4/hardware/src/v4_hardware_interface.cpp.
+        # This class speaks SDK order; _controller_joint_names is the order
+        # the forward_command_controller expects on the wire.
         self._joint_names = [
             '{}joint{}{}'.format(joint_prefix, finger, joint)
+            for finger in (1, 2, 3, 0) for joint in range(4)
+        ]
+        self._controller_joint_names = [
+            '{}joint{}{}'.format(joint_prefix, finger, joint)
             for finger in range(4) for joint in range(4)
+        ]
+        # _command_order[i] is the index into an SDK-ordered command of the
+        # value that belongs in slot i of the controller's command array.
+        self._command_order = [
+            self._joint_names.index(name)
+            for name in self._controller_joint_names
         ]
 
         ns = '/{}'.format(namespace.strip('/')) if namespace else ''
@@ -90,6 +113,20 @@ class Allegro(Node):
             ListControllers, '{}/controller_manager/list_controllers'.format(ns))
         self._switch_controller_client = self.create_client(
             SwitchController, '{}/controller_manager/switch_controller'.format(ns))
+
+        # _active_controller caches which controller we last activated so the
+        # 20 Hz command path does not need a list_controllers round trip. The
+        # cache goes stale if anything else switches controllers (or a
+        # controller deactivates on error), which would silently publish
+        # commands nobody is listening to. Watch each controller's lifecycle
+        # transitions so the cache is invalidated without polling.
+        for controller in (position_controller, grasp_controller):
+            self.create_subscription(
+                TransitionEvent,
+                '{}/{}/transition_event'.format(ns, controller),
+                lambda msg, name=controller: self._transition_callback(
+                    name, msg),
+                10)
 
         self._executor = None
         self._spin_thread = None
@@ -138,6 +175,20 @@ class Allegro(Node):
         self.command_hand_configuration('off')
         if self._executor is not None:
             self._executor.shutdown()
+            # The spin thread must be joined before the node (and the rclpy
+            # context behind it) is torn down, otherwise it is still inside
+            # spin() during interpreter shutdown and the process aborts.
+            if self._spin_thread is not None:
+                self._spin_thread.join(timeout=5.0)
+            self._executor = None
+            self._spin_thread = None
+
+    def _transition_callback(self, controller, msg):
+        """Track controller lifecycle changes so _active_controller stays honest."""
+        if msg.goal_state.label == 'active':
+            self._active_controller = controller
+        elif self._active_controller == controller:
+            self._active_controller = None
 
     def _joint_state_callback(self, data):
         # The joint_state_broadcaster does not guarantee the same joint
@@ -217,11 +268,12 @@ class Allegro(Node):
         Command a specific desired hand pose.
 
         The desired pose must be the correct dimensionality (self._num_joints)
-        and ordered finger-major (joint00..03, joint10..13, ...), the same
-        ordering as the old allegroHand joint_cmd topic. Only the pose is
-        commanded, and **no bound-checking happens here**: any commanded
-        pose must be valid or Bad Things May Happen. (Generally, values
-        between 0.0 and 1.5 are fine, but use this at your own risk.)
+        and ordered index, middle, ring, thumb (joint10..13, joint20..23,
+        joint30..33, joint00..03), the same ordering as the old allegroHand
+        joint_cmd topic. Only the pose is commanded, and **no bound-checking
+        happens here**: any commanded pose must be valid or Bad Things May
+        Happen. (Generally, values between 0.0 and 1.5 are fine, but use
+        this at your own risk.)
 
         :param desired_pose: The desired joint configurations.
         :return: True if pose is published, False otherwise.
@@ -241,7 +293,10 @@ class Allegro(Node):
 
         msg = Float64MultiArray()
         try:
-            msg.data = [float(x) for x in desired_pose]
+            values = [float(x) for x in desired_pose]
+            # Reorder from SDK order (index, middle, ring, thumb) into the
+            # controller's joint order (thumb first) before publishing.
+            msg.data = [values[i] for i in self._command_order]
             self.pub_joint.publish(msg)
             self.get_logger().debug('Published desired pose.')
             return True
@@ -271,8 +326,8 @@ class Allegro(Node):
 
         :param wait: If true, waits for a 'fresh' state reading.
         :param timeout: Max seconds to wait for a fresh reading.
-        :return: (positions, efforts) ordered finger-major, or None if no
-        state has been received.
+        :return: (positions, efforts) in SDK order (index, middle, ring,
+        thumb), or None if no state has been received.
         """
         if wait:  # Clear joint state and wait for the next reading.
             self._joint_state = None
