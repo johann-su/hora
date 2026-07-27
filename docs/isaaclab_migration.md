@@ -58,8 +58,8 @@ everything else); M2 turns on multi-scale and eats the construction cost.
 | M0 | Env + assets ready ✅ **done** | `assets/usd/` populated (96/96); IsaacLab 2.3.1 installed in `env_isaaclab`; `verify_hand_asset.py` passes |
 | M1 | Core env ports, single scale, no ROS ✅ **done** | `train.py` runs stage 1 PPO; reward curve rises |
 | M2 | Domain randomization + multi-scale ✅ **done** | `train_s1.sh` runs unmodified; per-env scale/mass/CoM/friction verified |
-| M3 | Grasp generation ⚠️ **partial** | `gen_grasp.py` regenerates the 9 caches |
-| M4 | ROS 2 sim-in-the-loop | `deploy.py` drives sim through ros2_control, unmodified |
+| M3 | Grasp generation ✅ **done** | `gen_grasp.py` regenerates a cache validated equivalent to the published one |
+| M4 | ROS 2 sim-in-the-loop ⚠️ **partial** | `deploy.py` drives sim through ros2_control, unmodified |
 
 M3 depends on M0 only, so it can run in parallel with M1/M2 if the caches must be
 regenerated early. The published caches are downloaded (26 files, every scale in
@@ -519,11 +519,25 @@ should reproduce that.
 
 ### M3 findings
 
-**Status: the machinery works, the yield is not yet validated.** Contact sensing,
-filtering, collection and cache writing all run; a 1024-env run collected 7,431 / 50,000
-poses in ~7 minutes (so a full cache is roughly 45-60 min). What has *not* been checked is
-whether the generated poses are equivalent to the published ones — that comparison is the
-real exit criterion and is still open.
+**Validated against the published cache.** A full 50,000-pose cache was generated for
+scale 0.8 (2048 envs, ~28 min) and compared with the published one both statistically and
+functionally:
+
+| | published | generated |
+|---|---|---|
+| rows | 50,000 | 50,000 |
+| joint mean abs difference | — | max 0.026 rad (1.5°), avg 0.006 rad |
+| object pos mean (x, y, z) | -0.0093, -0.0055, 0.6518 | -0.0088, -0.0042, 0.6525 |
+| quaternion norm | 1.0000 | 1.0000 |
+| fingertip-object distance at reset | 0.0845 m | 0.0850 m |
+| **held, zero actions, 100 steps** | **1.000** | **1.000** |
+
+Joint ranges stay inside the published envelope; object-position spread is slightly wider
+(std 0.0107 vs 0.0072 in x), i.e. marginally more diverse rather than degenerate.
+
+Only scale 0.8 was regenerated and validated — the remaining eight scales are the same
+command with a different `baseObjScale` (see the loop in `scripts/gen_grasp.sh`), roughly
+30-60 min each. The published caches are still in `cache/` and untouched.
 
 **The contact filter must name the rigid body, not the spawn path.** The URDF importer
 wraps each link in an Xform, so the USD default prim is `/ball` and the body is at
@@ -563,40 +577,124 @@ condition used a generous 0.1 m.
 Goal: `deploy.py` and the whole ros2_control stack run **unmodified** against Isaac Sim.
 Nothing in the policy path should branch on sim vs hardware.
 
-### `ros2_allegro/.../allegro_hand.ros2_control.xacro` — MODIFY
+**No physical hand is needed for any of this.** Isaac Sim *replaces* the hardware, so M4
+is implementable and largely verifiable without an Allegro. What the hand is needed for is
+the separate question of sim-to-real parity — see "Needs hardware" below.
 
-The launch files already advertise `ros2_control_hardware_type:=isaac`, but it is
-vapourware — copy-paste from a MoveIt template with no matching `<xacro:if>` in the
-hardware block. Add the branch.
+### Verified without hardware ✅
 
-Two implementations, in order of preference:
+**The ROS 2 deployment path works end to end against `mock_components`.** With the
+devcontainer running:
 
-1. **`topic_based_ros2_control`** (PickNikRobotics) — a generic hardware interface that
-   reads/writes `JointState` topics. Isaac Sim then needs only the stock
-   `ROS2PublishJointState` / `ROS2SubscribeJointState` OmniGraph nodes, and **no custom
-   C++ is written at all**. Confirm Humble availability before committing to this.
-2. **Custom `isaac` hardware plugin** — more work, but `allegro_hand_hardwares/gazebo/plugin`
-   is a working structural template already in the tree.
+```bash
+ros2 launch allegro_hand_bringup allegro_hand.launch.py \
+     ros2_control_hardware_type:=mock_components
+./scripts/deploy.sh hora_v0.0.2
+```
 
-Do not bypass ros2_control by having Isaac Sim publish the controller topics directly:
-`Allegro._activate_controller()` makes real `controller_manager` service calls, which
-would have nothing to answer them.
+Confirmed live: `allegro_hand_position_controller` **active** with all 16 joints claimed;
+`/allegro_hand_position_controller/commands` showing publisher 1 / subscriber 1; and
+`/joint_states` reporting varied non-zero positions tracking the policy's commands. So the
+policy → controller_manager → hardware-interface path is sound, and the only thing M4 adds
+is swapping the hardware interface underneath it.
 
-### Sim-side bridge scene — NEW
+Note `deploy.py` prints progress with `tprint` (carriage return, no newline), so its stdout
+looks empty while it is in fact running. Check `ros2 topic info` rather than the console.
 
-An Isaac Sim scene/script for the single-env deployment case that publishes
-`/joint_states` and subscribes to joint commands, with the joint-name mapping
-`joint_N.0` ↔ `ah_joint{finger}{joint}`. Note this is a *third* joint ordering in the
-system, alongside hora order and controller order — put the mapping in one place with the
-same kind of assertion used in M1.
+**No custom C++ is required.** `ros-humble-topic-based-ros2-control` is packaged for
+Humble (0.2.0) and is now installed in the container. Its `TopicBasedSystem` exchanges
+`sensor_msgs/JointState` with any simulator, so the Isaac-specific hardware plugin the
+plan originally contemplated is unnecessary.
 
-### Verification
+**The `isaac` hardware type is now real.** It was advertised in every launch file's help
+string but had no matching branch in the xacro. Added, and verified to expand:
 
-Run `./scripts/deploy.sh` with `ros2_control_hardware_type:=isaac` and confirm it behaves
-as it does against `mock_components`, then against hardware. Because the stack is
-identical, a discrepancy localises to the sim, not the plumbing.
+```bash
+xacro .../allegro_hand.urdf.xacro ros2_control_hardware_type:=isaac
+# -> <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
+#    joint_states_topic=/isaac_joint_states  joint_commands_topic=/isaac_joint_commands
+```
 
----
+Deliberately **not** `/joint_states`: `joint_state_broadcaster` publishes there, and
+reusing it would feed the stack its own output.
+
+**The Isaac ROS 2 bridge extension loads from a standalone IsaacLab script**, exposing the
+nodes the design needs (`ROS2Context`, `ROS2PublishJointState`, `ROS2SubscribeJointState`)
+— given the `ROS_DISTRO` / `RMW_IMPLEMENTATION` / `LD_LIBRARY_PATH` exports from the
+README.
+
+### Blocked ⚠️
+
+`scripts/sim_ros2_bridge.py` is written but **does not run**. Building the OmniGraph fails:
+
+```
+[omni.graph.core.plugin] Unable to create prim for graph at /ActionGraph
+OmniGraphError: Failed to wrap graph in node given {'graph_path': ..., 'evaluator_name': 'execution'}
+```
+
+Moving the graph under `/World` and constructing it after `sim.reset()` did not help. Two
+things are already established and worth keeping: `omni.graph` is not importable until
+`omni.graph.action` / `isaacsim.core.nodes` / `isaacsim.ros2.bridge` are enabled, so the
+enables must precede the import; and the bridge extension itself loads fine.
+
+Two candidate ways forward, neither yet attempted:
+
+1. **Fix the OmniGraph construction.** Most likely the graph needs creating against an
+   explicitly-set stage, or via `omni.graph.core.Controller` with the ROS 2 bridge's own
+   sample as the template rather than a hand-written node list. Closest reference is
+   Isaac Sim's own ROS 2 joint-control sample.
+2. **Bypass OmniGraph entirely.** Have the Isaac script speak a plain socket, and run a
+   small `rclpy` relay inside the devcontainer that bridges socket ↔ ROS topics. This
+   sidesteps OmniGraph *and* the rclpy-version problem (the host conda env is Python 3.11
+   with no rclpy; Humble's rclpy is 3.10), and it is the natural home for the joint-name
+   remap below. Less "native", equally valid for the purpose, and much easier to debug.
+
+### Joint-name remapping — required either way
+
+This is a third naming boundary in the system and must live in exactly one place:
+
+| | names | order |
+|---|---|---|
+| hora policy / cache / `deploy.py` | — | index, thumb, middle, ring |
+| hora sim asset (converted USD) | `joint_0_0 … joint_15_0` | PhysX breadth-first |
+| ros2_allegro stack | `ah_joint00 … ah_joint33` | thumb-first (`joint00..03` = thumb) |
+
+The hora asset and the ros2_allegro description are **different URDFs of the same hand**,
+so the sim cannot simply adopt the ROS names. `deploy.py` already handles hora ↔ SDK order
+(`_obs_allegro2hora` / `_action_hora2allegro`) and `algo/deploy/robots/allegro.py` already
+handles SDK ↔ controller order; M4 adds sim-asset ↔ `ah_*`, which belongs in the relay or
+the bridge, asserted at startup the way `scripts/verify_hand_asset.py` asserts the others.
+
+### Needs hardware ❌
+
+These cannot be closed without a physical Allegro, and none of them block the M4
+implementation:
+
+- **Sim-to-real parity.** Whether a policy that works against the Isaac surrogate behaves
+  the same on the real hand — the actual reason M4 exists.
+- **The `physical_device` path after the xacro change.** The `isaac` branch is additive
+  and `mock_components` still expands correctly, but only real hardware proves the
+  physical branch is unaffected.
+- **Timing and latency.** The real hand runs a CAN bus with its own rate and jitter;
+  `topic_based_ros2_control` over DDS has a different profile. Only relevant once a policy
+  is being transferred.
+
+### Verification recipe, once the bridge runs
+
+```bash
+# host                                    # container
+export ROS_DOMAIN_ID=42 ...               ros2 launch allegro_hand_bringup \
+python scripts/sim_ros2_bridge.py              allegro_hand.launch.py \
+                                               ros2_control_hardware_type:=isaac
+                                          ./scripts/deploy.sh hora_v0.0.2
+```
+
+Expected: `/isaac_joint_states` visible from inside the container (this also proves
+host↔container DDS, which `--net=host` plus matching `ROS_DOMAIN_ID=42` and
+`ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` should give); the position controller active;
+and the simulated hand tracking the policy exactly as the mock hand does above. Because
+the stack is identical to the `mock_components` run, any discrepancy localises to the
+simulator rather than the plumbing.
 
 ## Files that do not change
 
