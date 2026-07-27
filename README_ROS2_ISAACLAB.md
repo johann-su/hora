@@ -64,8 +64,6 @@ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CONDA_PREFIX/lib/python3.11/site-packages/isaacsim/exts/isaacsim.ros2.bridge/humble/lib
 ``` 
 
-(This is only needed for the deployment/eval path — M4 of the migration plan, not wired up yet. Training needs none of it.)
-
 #### Isaaclab
 
 https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/pip_installation.html#installing-isaac-lab

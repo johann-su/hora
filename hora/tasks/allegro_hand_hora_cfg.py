@@ -4,8 +4,6 @@
 # Copyright (c) 2022 Haozhi Qi
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
-# M1 of the IsaacGym -> IsaacLab migration. See docs/isaaclab_migration.md.
-# --------------------------------------------------------
 
 """IsaacLab config for the in-hand rotation task.
 
@@ -47,7 +45,6 @@ HORA_JOINT_ORDER = (
     + [f'joint_{i}_0' for i in range(8, 12)]   # ring
 )
 
-# Fingertip bodies, in HORA_JOINT_ORDER finger order. Used by M3's contact sensing.
 HORA_FINGERTIP_BODIES = ['link_3_0', 'link_15_0', 'link_7_0', 'link_11_0']
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))

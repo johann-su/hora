@@ -192,7 +192,7 @@ class AllegroHandHora(DirectRLEnv):
                 raise FileNotFoundError(
                     f'grasp cache not found: {name}\n'
                     'Download the published caches (see README.md) or generate them with '
-                    'gen_grasp.py (M3 of docs/isaaclab_migration.md).')
+                    'gen_grasp.py.')
             data = torch.from_numpy(np.load(name)).float().to(self.device)
             data[:, 19:23] = quat_xyzw_to_wxyz(data[:, 19:23])
             self.saved_grasping_states[str(s)] = data

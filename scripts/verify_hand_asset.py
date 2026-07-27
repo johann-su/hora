@@ -4,8 +4,6 @@
 # Copyright (c) 2022 Haozhi Qi
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
-# M0 of the IsaacGym -> IsaacLab migration. See docs/isaaclab_migration.md.
-# --------------------------------------------------------
 
 """Pin down the converted Allegro hand's DOF order and joint limits.
 

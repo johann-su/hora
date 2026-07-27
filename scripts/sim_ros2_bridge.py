@@ -4,8 +4,6 @@
 # Copyright (c) 2022 Haozhi Qi
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
-# M4 of the IsaacGym -> IsaacLab migration. See docs/isaaclab_migration.md.
-# --------------------------------------------------------
 
 """Expose the Allegro hand in Isaac Sim as a ROS 2 joint-state/command endpoint.
 

@@ -4,8 +4,6 @@
 # Copyright (c) 2022 Haozhi Qi
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
-# M3 of the IsaacGym -> IsaacLab migration. See docs/isaaclab_migration.md.
-# --------------------------------------------------------
 
 """Config for grasp-pose generation.
 
@@ -52,23 +50,9 @@ def make_grasp_env_cfg(task_cfg: dict, num_envs: int | None = None) -> AllegroHa
                   'state_space', 'sim', 'scene', 'robot_cfg', 'object_cfg', 'object_scales'):
         setattr(cfg, field, getattr(base, field))
 
-    # Contact sensors resolve their targets through USD, and fabric clones are not
-    # visible to USD APIs -- the same trap that made multi-asset spawning silently
-    # collapse to one env in M2. Here it surfaces differently: the articulation itself
-    # fails to initialise ("Failed to get DOF velocities from backend").
     cfg.scene.clone_in_fabric = False
-    # Filtered contact pairs are resolved per environment by matching USD prim paths.
-    # Under replicate_physics the clones share one physics prototype, and the filter
-    # resolves against env_0 only -- force_matrix_w then stays identically zero even
-    # though the fingertips are demonstrably in contact (net_forces_w is nonzero).
     cfg.scene.replicate_physics = False
 
-    # The filter has to name the *rigid body*, which is one level below the spawn path:
-    # the URDF importer makes the USD default prim a plain Xform wrapping the link, so
-    # spawning at .../object puts the body at .../object/<link_name>. Filtering on the
-    # Xform resolves to a valid-but-empty pair set, and force_matrix_w then reads as all
-    # zeros forever -- not None, so it looks like "no contact" rather than a broken
-    # filter. That is a silent failure worth spelling out.
     body_name = _object_link_name(env_cfg_object_urdf(task_cfg))
     cfg.contact_sensors = tuple(
         ContactSensorCfg(

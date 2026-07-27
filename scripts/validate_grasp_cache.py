@@ -4,8 +4,6 @@
 # Copyright (c) 2022 Haozhi Qi
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
-# M3 of the IsaacGym -> IsaacLab migration. See docs/isaaclab_migration.md.
-# --------------------------------------------------------
 
 """Check that a generated grasp cache behaves like the published one.
 
