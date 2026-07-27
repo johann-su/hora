@@ -1,0 +1,3 @@
+[submodule "ros2_allegro"]
+	path = ros2_allegro
+	url = https://github.com/Wonikrobotics-git/allegro_hand_ros2

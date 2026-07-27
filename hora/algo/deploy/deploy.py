@@ -69,16 +69,17 @@ class HardwarePlayer(object):
         ])).to(self.device)
 
     def deploy(self):
-        import rospy
+        import time
+        import rclpy
         from hora.algo.deploy.robots.allegro import Allegro
-        # try to set up rospy
-        rospy.init_node('example')
-        allegro = Allegro(hand_topic_prefix='allegroHand_0')
+        # try to set up rclpy
+        rclpy.init()
+        allegro = Allegro()
         # Wait for connections.
-        rospy.sleep(0.5)
+        time.sleep(0.5)
 
         hz = 20
-        ros_rate = rospy.Rate(hz)
+        ros_rate = allegro.create_rate(hz)
 
         # command to the initial position
         for t in range(hz * 4):
