@@ -1,6 +1,5 @@
 *.egg-info
 /.vs
-/.vscode
 /_package
 /shaders
 ._tmptext.txt
@@ -18,4 +17,7 @@ outputs/
 *.npy
 
 outputs
-cache
+cach
+build
+install
+log

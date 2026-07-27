@@ -1,0 +1,13 @@
+# Based on: https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/pip_installation.html
+name: env_isaaclab
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://pypi.nvidia.com
+      - isaacsim[all,extscache]==5.1.0
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.7.0
+      - torchvision==0.22.0

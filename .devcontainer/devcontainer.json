@@ -1,0 +1,56 @@
+{
+    "name": "ROS 2 Development Container",
+    "privileged": true,
+    "remoteUser": "devuser",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "USERNAME": "devuser"
+        }
+    },
+    "features": {
+        "ghcr.io/anthropics/devcontainer-features/claude-code:1.0.5": {}
+    },
+    "workspaceFolder": "/home/lasr_ws",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/home/lasr_ws,type=bind",
+    "customizations": {
+        "vscode": {
+            "extensions":[
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-themes",
+                "twxs.cmake",
+                "donjayamanne.python-extension-pack",
+                "eamodio.gitlens",
+                "ms-iot.vscode-ros"
+            ]
+        }
+    },
+    "containerEnv": {
+        "DISPLAY": "unix:0",
+        "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
+        "ROS_DOMAIN_ID": "42",
+        "NVIDIA_VISIBLE_DEVICES": "all",
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,graphics,utility"
+    },
+    // "optional" so the container still starts on machines without an NVIDIA
+    // GPU (mock_components testing); when one is present the tooling adds
+    // --gpus all, which injects the host driver libraries the torch policy
+    // needs. Requires nvidia-container-toolkit on the host.
+    "hostRequirements": {
+        "gpu": "optional"
+    },
+    "runArgs": [
+        "--net=host",
+        "--pid=host",
+        "--ipc=host",
+        "-e", "DISPLAY=${env:DISPLAY}"
+    ],
+    "mounts": [
+       "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind,consistency=cached",
+       "source=/dev/dri,target=/dev/dri,type=bind,consistency=cached",
+       "source=${localEnv:HOME}/.claude,target=/home/devuser/.claude,type=bind,consistency=cached",
+       "source=${localEnv:HOME}/.claude.json,target=/home/devuser/.claude.json,type=bind,consistency=cached"
+    ],
+    "postCreateCommand": "pip3 install --no-cache-dir torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 -r requirements.txt && sudo rosdep update && sudo rosdep install --from-paths ./ --ignore-src -y && sudo chown -R $(whoami) /home/lasr_ws/"
+    // "postCreateCommand": "sudo chown -R $(whoami) /home/lasr_ws/"
+}
