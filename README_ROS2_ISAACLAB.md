@@ -94,7 +94,16 @@ Isaaclab expects 3D models to be in .usd format. Previously, all assets where in
 This wraps IsaacLab's own `scripts/tools/convert_urdf.py`, which launches Isaac Sim once per asset — takes a while to complete. Output goes to `assets/usd/` (gitignored), and re-running skips what is already converted, so an interrupted run can just be restarted. Paths are derived from the script's own location, so it works from any working directory.
 Set `ISAACLAB=` if the IsaacLab repo is not at `~/code/IsaacLab`.
 
-## Train
+## Training
+
+### Grasp Position Cache
+
+```bash
+# e.g. ./scripts/gen_grasp.sh 0 2
+./scripts/gen_grasp.sh ${GPU_ID} ${SCALE}
+```
+
+### Stage 1
 
 ```bash
 # e.g. ./scripts/train_s1.sh 0 0 debug
@@ -104,4 +113,17 @@ Set `ISAACLAB=` if the IsaacLab repo is not at `~/code/IsaacLab`.
 tensorboard
 ```bash
 tensorboard --logdir=outputs/AllegroHandHora/debug
+```
+
+### Train Stage 2
+
+```bash
+# e.g. ./scripts/train_s2.sh 0 0 debug
+./scripts/train_s2.sh ${GPU_ID} ${SEED_ID} ${OUTPUT_NAME}
+```
+
+## Deployment
+
+```bash
+scripts/deploy.sh ${OUTPUT_NAME}
 ```
