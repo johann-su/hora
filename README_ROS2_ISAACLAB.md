@@ -120,6 +120,31 @@ tensorboard --logdir=outputs/AllegroHandHora/debug
 ./scripts/train_s2.sh ${GPU_ID} ${SEED_ID} ${OUTPUT_NAME}
 ```
 
+### TUD HPC cluster
+
+If training on the hpc cluster:
+
+configure ssh according to: https://doc.zih.tu-dresden.de/access/ssh_login/#connecting-via-visual-studio-code
+
+allocate and connect to interactive compute node:
+```bash
+salloc --gres=gpu:1 --nodes 1 # optional -A p_lasr_students
+# connect to node: ssh c123 (capella compute node 123)
+```
+
+```bash
+ws_allocate conda_virtual_environment 1 # https://doc.zih.tu-dresden.de/software/python_virtual_environments/#conda-virtual-environment
+```
+
+```bash
+mkdir /data/horse/ws/<username>-conda_virtual_environment/conda-env    #Create directory for environment
+module load Anaconda3    #Load Anaconda
+conda config --set channel_priority strict
+conda env create --prefix /data/horse/ws/<username>-conda_virtual_environment/conda-env --file environment_isaaclab.yaml    #Create conda env in directory with packages from environment.yml file
+```
+
+TODO: HPC cluster cannot install isaaclab via pip (incompatible) - migrate to docker based deployment via singularity (https://compendium.hpc.tu-dresden.de/software/containers/)
+
 ## Deployment
 
 ```bash
