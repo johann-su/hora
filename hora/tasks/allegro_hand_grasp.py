@@ -242,6 +242,10 @@ class AllegroHandGrasp(AllegroHandHora):
         self.prev_targets[env_ids] = pos
         self.cur_targets[env_ids] = pos
         self.init_pose_buf[env_ids] = pos.clone()
+        # Same reason as in AllegroHandHora._reset_idx: the joints were just teleported,
+        # so the finite-difference buffer has to follow or the first substep sees a
+        # spurious velocity spike.
+        self._prev_dof_pos[env_ids] = pos
         if not self.torque_control:
             self.hand.set_joint_position_target(
                 pos, joint_ids=self._joint_idx, env_ids=env_ids)

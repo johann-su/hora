@@ -146,6 +146,10 @@ class AllegroHandHora(DirectRLEnv):
         self.actions = torch.zeros((n, self.num_actions), device=device)
         self.torques = torch.zeros((n, self.num_actions), device=device)
         self.dof_vel_finite_diff = torch.zeros((n, self.num_hand_dofs), device=device)
+        # Previous substep's joint position, for the finite-difference velocity in
+        # _apply_action. Seeded from the current pose so the first substep reads zero
+        # velocity rather than a spike off an all-zeros buffer.
+        self._prev_dof_pos = self.hand_dof_pos.clone()
         self.rot_axis_buf = torch.zeros((n, 3), device=device)
 
         self.p_gain = torch.ones((n, self.num_actions), device=device) * self.p_gain_val
@@ -306,13 +310,24 @@ class AllegroHandHora(DirectRLEnv):
             self.rb_forces, torch.zeros_like(self.rb_forces))
 
     def _apply_action(self):
-        """Called once per physics step inside the decimation loop -- hora's 120 Hz PD."""
-        previous_dof_pos = self.hand_dof_pos.clone()
-        self.hand.update(self.cfg.sim.dt)
+        """Called once per physics step inside the decimation loop -- hora's 120 Hz PD.
+
+        The joint velocity is a finite difference across one physics substep, and it has
+        to be carried in an explicit buffer. The IsaacGym original could read the same
+        property twice -- once before ``_refresh_gym()`` and once after -- because gym
+        state tensors only moved on an explicit refresh, so the first read returned the
+        previous substep's value. IsaacLab has no such staleness: ``scene.update()`` bumps
+        the articulation timestamp at the end of every substep, so ``hand_dof_pos`` here
+        is *already* the post-step value and an ``Articulation.update()`` in between just
+        re-reads the same numbers out of PhysX. Doing it that way makes dof_vel identically
+        zero, which silently kills both the D term below and the work penalty in
+        ``_get_rewards`` (workPenaltyScale is the largest weight in the reward).
+        """
+        dof_pos = self.hand_dof_pos
+        dof_vel = (dof_pos - self._prev_dof_pos) / self.cfg.sim.dt
+        self._prev_dof_pos[:] = dof_pos
 
         if self.torque_control:
-            dof_pos = self.hand_dof_pos
-            dof_vel = (dof_pos - previous_dof_pos) / self.cfg.sim.dt
             self.dof_vel_finite_diff = dof_vel.clone()
             torques = self.p_gain * (self.cur_targets - dof_pos) - self.d_gain * dof_vel
             self.torques = torch.clip(torques, -0.5, 0.5).clone()
@@ -481,6 +496,10 @@ class AllegroHandHora(DirectRLEnv):
             self.prev_targets[s_ids] = pos
             self.cur_targets[s_ids] = pos
             self.init_pose_buf[s_ids] = pos.clone()
+            # Reset teleports the joints, so carry the new pose into the finite-difference
+            # buffer too -- otherwise the first substep differences against the pre-reset
+            # pose and reports a huge spurious velocity into the D term and work penalty.
+            self._prev_dof_pos[s_ids] = pos
 
         if not self.torque_control:
             self.hand.set_joint_position_target(
