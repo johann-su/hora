@@ -11,4 +11,4 @@ task.env.randomization.randomizePDGains=False \
 task.env.randomization.randomizeScale=True \
 train.ppo.priv_info=True \
 train.ppo.output_name=AllegroHandHora/"${CACHE}" \
-checkpoint=outputs/AllegroHandHora/"${CACHE}"/stage1_nn/best.pth
+checkpoint=outputs/AllegroHandHora/"${CACHE}"/stage1_nn/"${CHECKPOINT:-best.pth}"

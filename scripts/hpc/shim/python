@@ -1,0 +1,14 @@
+#!/bin/bash
+# `python` inside the IsaacLab container.
+#
+# scripts/train_s1.sh, train_s2.sh and gen_grasp.sh all invoke plain `python`,
+# which on the host is the env_isaaclab conda python. In the container the only
+# interpreter that can import isaacsim is Isaac Sim's own, and the image exposes
+# it as an *alias* in /root/.bashrc -- aliases do not apply to non-interactive
+# shells, so those scripts would otherwise pick up the system python3 and fail
+# at `from isaaclab.app import AppLauncher`.
+#
+# run_in_container.sh puts this directory first on PATH so the existing training
+# scripts run unmodified on the cluster; they stay the single source of truth
+# for the hydra overrides.
+exec /isaac-sim/python.sh "$@"

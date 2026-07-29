@@ -96,10 +96,20 @@ Set `ISAACLAB=` if the IsaacLab repo is not at `~/code/IsaacLab`.
 
 ### Grasp Position Cache
 
+One scale per invocation -- a SimulationContext cannot be rebuilt in-process, so each scale needs its own process.
+
 ```bash
-# e.g. ./scripts/gen_grasp.sh 0 2
+# e.g. ./scripts/gen_grasp.sh 0 0.8
 ./scripts/gen_grasp.sh ${GPU_ID} ${SCALE}
 ```
+
+`task.env.randomization.randomizeScaleList` is the list that matters -- generate every entry, since `_load_grasp_cache` looks up one cache file per scale in `cfg.object_scales`:
+
+```bash
+for s in 0.7 0.72 0.74 0.76 0.78 0.8 0.82 0.84 0.86; do ./scripts/gen_grasp.sh 0 $s; done
+```
+
+Output lands in `cache/${grasp_cache_name}_grasp_50k_s${scale_without_dot}.npy` (0.8 -> `s08`), 50000 rows of `[16 joint pos (hora order), 3 object xyz, 4 object quat (xyzw)]`.
 
 ### Stage 1
 
@@ -124,57 +134,84 @@ tensorboard --logdir=outputs/AllegroHandHora/debug
 
 Everything cluster specific is in `scripts/hpc/`.
 
+- Cluster container docs: https://compendium.hpc.tu-dresden.de/software/containers/
+- IsaacLab cluster docs: https://isaac-sim.github.io/IsaacLab/main/source/deployment/cluster.html
+
 #### One-time setup
 
-**SSH:** follow https://doc.zih.tu-dresden.de/access/ssh_login/
-
-Allocate a workspace. `$HOME` is the wrong place for any of this: the image alone is 7.8 GB, and Isaac Sim's shader caches are write-heavy.
+Build isaaclab container (from published isaaclab image, not build from source):
 ```bash
-# eg ws_allocate -F horse hora 1 
+apptainer build isaac-lab-2.3.1.sif docker://nvcr.io/nvidia/isaac-lab:2.3.1
+
+docker save my-isaac-lab:latest -o my-isaac-lab.tar
+rsync -P my-isaac-lab.tar <login>:/data/horse/ws/$USER-hora/sif/
+apptainer build my-isaac-lab.sif docker-archive://my-isaac-lab.tar
+```
+
+**SSH:** follow https://doc.zih.tu-dresden.de/access/ssh_login/.
+
+**Workspace.**
+
+```bash
+# eg ws_allocate -F horse hora 90
 ws_allocate -F <fs> hora <alloc-days>     # -> /data/horse/ws/<user>-hora
 ```
 
-**Isaaclab:**
-Isaaclab docs: https://isaac-sim.github.io/IsaacLab/main/source/deployment/cluster.html
+Change config in `scripts/hpc/cluster.env`
+
+**Push the code, build the image, install the missing deps:**
 
 ```bash
-git clone https://github.com/isaac-sim/IsaacLab.git --branch main
-cd IsaacLab
-git checkout v2.3.1
+./scripts/hpc/sync.sh                                    # local -> workspace
+
+ssh login1.capella.hpc.tu-dresden.de
+cd /data/horse/ws/$USER-hora/hora
+./scripts/hpc/build_image.sh --submit                    # ~8 min batch job
+./scripts/hpc/setup_deps.sh                              # after the build finishes
 ```
 
-Edit cluster config:
+#### Running jobs
+
+Run from the login node, in the synced copy:
 ```bash
-vim docker/cluster/.env.cluster
+cd /data/horse/ws/$USER-hora/hora
+
+./scripts/hpc/submit.sh gen_grasp 0.8                    # one scale per job
+./scripts/hpc/submit.sh train_s1 0 hora_v1 overwrite=True
+./scripts/hpc/submit.sh train_s2 0 hora_v1 overwrite=True
+./scripts/hpc/submit.sh raw scripts/eval_s1.sh 0 hora_v1 # anything else
+
+# every scale the training config expects
+for s in 0.7 0.72 0.74 0.76 0.78 0.8 0.82 0.84 0.86; do
+    ./scripts/hpc/submit.sh gen_grasp $s
+done
 ```
 
-```
-###
-# Cluster specific settings
-###
-
-# Job scheduler used by cluster.
-# Currently supports PBS and SLURM
-CLUSTER_JOB_SCHEDULER=SLURM
-# Docker cache dir for Isaac Sim (has to end on docker-isaac-sim)
-# e.g. /cluster/scratch/$USER/docker-isaac-sim
-CLUSTER_ISAAC_SIM_CACHE_DIR=/data/horse/ws/joss478d-hora/docker-isaac-sim
-# Isaac Lab directory on the cluster (has to end on isaaclab)
-# e.g. /cluster/home/$USER/isaaclab
-CLUSTER_ISAACLAB_DIR=/home/joss478d/isaaclab
-# Cluster login
-CLUSTER_LOGIN=joss478d@capella.hpc.tu-dresden.de
-# Cluster scratch directory to store the SIF file
-# e.g. /cluster/scratch/$USER
-CLUSTER_SIF_PATH=/data/horse/ws/joss478d-hora
-# Remove the temporary isaaclab code copy after the job is done
-REMOVE_CODE_COPY_AFTER_JOB=false
-# Python executable within Isaac Lab directory to run with the submitted job
-CLUSTER_PYTHON_EXECUTABLE=
-```
-
-export singularity image:
+Resources default to one GPU's share and 8 h; override per submission:
 ```bash
-# profile is optional - base profile if omitted
-./docker/cluster/cluster_interface.sh push [profile]
+HORA_TIME=23:00:00 HORA_MEM=240G ./scripts/hpc/submit.sh train_s1 0 hora_v1
+```
+
+Logs land in `/data/horse/ws/$USER-hora/slurm-logs/<job-name>-<jobid>.out`.
+
+#### Getting results back
+
+```bash
+./scripts/hpc/fetch.sh              # all of outputs/
+./scripts/hpc/fetch.sh hora_v1      # one run
+./scripts/hpc/fetch.sh --cache      # grasp caches generated on the cluster
+./scripts/hpc/fetch.sh --logs       # SLURM logs
+```
+
+`sync.sh` excludes `outputs/` by default so a push cannot clobber a running job's
+checkpoints; use `--with-outputs` when stage 2 needs a stage-1 checkpoint that
+only exists locally.
+
+#### Interactive debugging
+
+```bash
+srun -A p_lasr_students -p capella --gres=gpu:1 -c 14 --mem=180G -t 2:00:00 --pty bash
+cd /data/horse/ws/$USER-hora/hora
+./scripts/hpc/run_in_container.sh bash                   # shell inside the image
+./scripts/hpc/run_in_container.sh python train.py ...    # -> /isaac-sim/python.sh
 ```
