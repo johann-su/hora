@@ -96,10 +96,22 @@ def main(config: DictConfig):
             'stage1_nn' if config.train.algo == 'PPO' else 'stage2_nn', 'best.pth'
         )
         if os.path.exists(best_ckpt_path):
-            user_input = input(
-                f'are you intentionally going to overwrite files in {config.train.ppo.output_name}, type yes to continue \n')
-            if user_input != 'yes':
-                exit()
+            # Batch schedulers give the job no stdin, so the prompt below would die with
+            # EOFError several minutes into startup (after Isaac Sim has already come up).
+            # Under SLURM the answer has to be given up front via `overwrite=True`.
+            if config.overwrite:
+                cprint(f'overwrite=True: overwriting {config.train.ppo.output_name}', 'yellow', attrs=['bold'])
+            elif not sys.stdin.isatty():
+                cprint(
+                    f'{best_ckpt_path} exists and there is no terminal to confirm from.\n'
+                    'Re-run with overwrite=True, or pick a different train.ppo.output_name.',
+                    'red', attrs=['bold'])
+                exit(1)
+            else:
+                user_input = input(
+                    f'are you intentionally going to overwrite files in {config.train.ppo.output_name}, type yes to continue \n')
+                if user_input != 'yes':
+                    exit()
 
         agent.restore_train(config.train.load_path)
         agent.train()

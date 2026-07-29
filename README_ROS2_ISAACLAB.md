@@ -120,33 +120,61 @@ tensorboard --logdir=outputs/AllegroHandHora/debug
 ./scripts/train_s2.sh ${GPU_ID} ${SEED_ID} ${OUTPUT_NAME}
 ```
 
-### TUD HPC cluster
+### TUD HPC cluster (Capella)
 
-If training on the hpc cluster:
+Everything cluster specific is in `scripts/hpc/`.
 
-configure ssh according to: https://doc.zih.tu-dresden.de/access/ssh_login/#connecting-via-visual-studio-code
+#### One-time setup
 
-allocate and connect to interactive compute node:
+**SSH:** follow https://doc.zih.tu-dresden.de/access/ssh_login/
+
+Allocate a workspace. `$HOME` is the wrong place for any of this: the image alone is 7.8 GB, and Isaac Sim's shader caches are write-heavy.
 ```bash
-salloc --gres=gpu:1 --nodes 1 # optional -A p_lasr_students
-# connect to node: ssh c123 (capella compute node 123)
+# eg ws_allocate -F horse hora 1 
+ws_allocate -F <fs> hora <alloc-days>     # -> /data/horse/ws/<user>-hora
 ```
 
+**Isaaclab:**
+Isaaclab docs: https://isaac-sim.github.io/IsaacLab/main/source/deployment/cluster.html
+
 ```bash
-ws_allocate conda_virtual_environment 1 # https://doc.zih.tu-dresden.de/software/python_virtual_environments/#conda-virtual-environment
+git clone https://github.com/isaac-sim/IsaacLab.git --branch main
+cd IsaacLab
+git checkout v2.3.1
 ```
 
+Edit cluster config:
 ```bash
-mkdir /data/horse/ws/<username>-conda_virtual_environment/conda-env    #Create directory for environment
-module load Anaconda3    #Load Anaconda
-conda config --set channel_priority strict
-conda env create --prefix /data/horse/ws/<username>-conda_virtual_environment/conda-env --file environment_isaaclab.yaml    #Create conda env in directory with packages from environment.yml file
+vim docker/cluster/.env.cluster
 ```
 
-TODO: HPC cluster cannot install isaaclab via pip (incompatible) - migrate to docker based deployment via singularity (https://compendium.hpc.tu-dresden.de/software/containers/)
+```
+###
+# Cluster specific settings
+###
 
-## Deployment
+# Job scheduler used by cluster.
+# Currently supports PBS and SLURM
+CLUSTER_JOB_SCHEDULER=SLURM
+# Docker cache dir for Isaac Sim (has to end on docker-isaac-sim)
+# e.g. /cluster/scratch/$USER/docker-isaac-sim
+CLUSTER_ISAAC_SIM_CACHE_DIR=/data/horse/ws/joss478d-hora/docker-isaac-sim
+# Isaac Lab directory on the cluster (has to end on isaaclab)
+# e.g. /cluster/home/$USER/isaaclab
+CLUSTER_ISAACLAB_DIR=/home/joss478d/isaaclab
+# Cluster login
+CLUSTER_LOGIN=joss478d@capella.hpc.tu-dresden.de
+# Cluster scratch directory to store the SIF file
+# e.g. /cluster/scratch/$USER
+CLUSTER_SIF_PATH=/data/horse/ws/joss478d-hora
+# Remove the temporary isaaclab code copy after the job is done
+REMOVE_CODE_COPY_AFTER_JOB=false
+# Python executable within Isaac Lab directory to run with the submitted job
+CLUSTER_PYTHON_EXECUTABLE=
+```
 
+export singularity image:
 ```bash
-scripts/deploy.sh ${OUTPUT_NAME}
+# profile is optional - base profile if omitted
+./docker/cluster/cluster_interface.sh push [profile]
 ```

@@ -32,6 +32,10 @@ checkpoint: ''
 # disables rendering
 headless: False
 
+# allow a training run to overwrite an existing checkpoint without being asked.
+# Required for batch jobs (SLURM), which have no terminal to answer the prompt from.
+overwrite: False
+
 # set default task and default training config based on task
 defaults:
   - _self_
